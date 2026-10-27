@@ -1,0 +1,4 @@
+# NB Do not install from this requirements file
+# It is for documentation purposes only
+-r ../requirements/requirements_cpu.txt
+-r ../requirements/_requirements_dev.txt

@@ -1,0 +1,488 @@
+#!/usr/bin python3
+"""Face and landmarks detection for faceswap.py"""
+from __future__ import annotations
+import logging
+import typing as T
+
+from zlib import compress, decompress
+
+import numpy as np
+
+from lib.logger import format_array, parse_class_init
+from lib.utils import get_module_objects
+from .objects import FileAlignments, PNGAlignments
+from .aligned_face import AlignedFace
+from . import aligned_mask
+
+if T.TYPE_CHECKING:
+    import numpy.typing as npt
+    from .aligned_face import CenteringType
+
+logger = logging.getLogger(__name__)
+
+
+class DetectedFace:  # pylint:disable=too-many-instance-attributes
+    """Detected face and landmark information
+
+    Holds information about a detected face, it's location in a source image
+    and the face's 68 point landmarks.
+
+    Methods for aligning a face are also callable from here.
+
+    Parameters
+    ----------
+    image
+        Original frame that holds this face. Optional (not required if just storing coordinates).
+        Default: ``None``
+    left
+        The left most point (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`
+    width
+        The width (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`
+    top
+        The top most point (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`
+    height
+        The height (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`
+    landmarks_xy
+        The 68 point landmarks as discovered in :mod:`plugins.extract.align`. Should be an array
+        of 68 `(x, y)` points of each of the landmark co-ordinates.
+    mask
+        The generated mask(s) for the face as generated in :mod:`plugins.extract.mask`.
+    """
+    def __init__(self,
+                 image: np.ndarray | None = None,
+                 left: int | None = None,
+                 width: int | None = None,
+                 top: int | None = None,
+                 height: int | None = None,
+                 landmarks_xy: np.ndarray | None = None,
+                 mask: dict[str, aligned_mask.Mask] | None = None,
+                 identity: dict[str, np.ndarray] | None = None) -> None:
+        logger.trace(parse_class_init(locals()))  # type:ignore[attr-defined]
+        self.image = image
+        """This is a generic image placeholder that should not be relied on to be holding a
+        particular image. It may hold the source frame that holds the face, a cropped face or
+        a scaled image depending on the method using this object."""
+        self.left = left
+        """The left most point (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`"""
+        self.width = width
+        """The width (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`"""
+        self.top = top
+        """The top most point (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`"""
+        self.height = height
+        """The height (in pixels) of the face's bounding box as discovered in
+        :mod:`plugins.extract.detect`"""
+        self.mask = {} if mask is None else mask
+        """The generated mask(s) for the face as generated in :mod:`plugins.extract.mask`"""
+        self._landmarks_xy = landmarks_xy
+        self._identity: dict[str, np.ndarray] = {} if identity is None else identity
+        self.thumbnail: np.ndarray | None = None
+
+        self._training_masks: tuple[bytes, tuple[int, int, int]] | None = None
+        self._aligned: AlignedFace | None = None
+        logger.trace("Initialized %s", self.__class__.__name__)  # type:ignore[attr-defined]
+
+    def __repr__(self) -> str:
+        """Pretty print for logging"""
+        params = {k: v for k, v in self.__dict__.items()
+                  if k in ("image", "left", "width", "top",
+                           "height", "bottom", "_landmarks_xy", "mask")}
+        params = {
+            k[1:] if k.startswith("_") else k: format_array(v) if isinstance(v, np.ndarray) else v
+            for k, v in params.items()
+            }
+        s_params = ", ".join(f"{k}={v}" for k, v in params.items())
+        return f"{self.__class__.__name__}({s_params})"
+
+    @property
+    def aligned(self) -> AlignedFace:
+        """The aligned face connected to this detected face."""
+        assert self._aligned is not None
+        return self._aligned
+
+    @property
+    def has_landmarks(self) -> bool:
+        """``True`` if this object contains landmarks"""
+        return self._landmarks_xy is not None
+
+    @property
+    def landmarks_xy(self) -> np.ndarray:
+        """The frame space 2D landmarks for this detected face."""
+        assert self._landmarks_xy is not None
+        return self._landmarks_xy
+
+    @property
+    def right(self) -> int:
+        """Right point (in pixels) of face detection bounding box within the parent image"""
+        assert self.left is not None and self.width is not None
+        return self.left + self.width
+
+    @property
+    def bottom(self) -> int:
+        """Bottom point (in pixels) of face detection bounding box within the parent image"""
+        assert self.top is not None and self.height is not None
+        return self.top + self.height
+
+    @property
+    def identity(self) -> dict[str, np.ndarray]:
+        """Identity mechanism as key, identity embedding as value"""
+        return self._identity
+
+    def add_mask(self,
+                 name: str,
+                 mask: npt.NDArray[np.uint8],
+                 affine_matrix: np.ndarray,
+                 storage_size: int = 128,
+                 storage_centering: CenteringType = "face") -> None:
+        """Add a :class:`~lib.align.aligned_mask.Mask` to this detected face
+
+        The mask should be the original output from  :mod:`plugins.extract.mask`
+        If a mask with this name already exists it will be overwritten by the given
+        mask.
+
+        Parameters
+        ----------
+        name
+            The name of the mask as defined by the :attr:`plugins.extract.mask._base.name`
+            parameter.
+        mask
+            The mask that is to be added as output from :mod:`plugins.extract.mask` as a UINT8
+            image
+        affine_matrix
+            The transformation matrix required to transform the mask to the original frame.
+        storage_size
+            The size the mask is to be stored at. Default: 128
+        storage_centering
+            The centering to store the mask at. One of `"legacy"`, `"face"`, `"head"`.
+            Default: `"face"`
+        """
+        logger.trace("name: '%s', mask shape: %s, affine_matrix: %s, "  # type:ignore[attr-defined]
+                     "storage_size: %s, storage_centering: %s)", name,
+                     mask.shape, affine_matrix, storage_size, storage_centering)
+        fs_mask = aligned_mask.Mask(storage_size=storage_size, storage_centering=storage_centering)
+        fs_mask.add(mask, affine_matrix)
+        self.mask[name] = fs_mask
+
+    def add_landmarks_xy(self, landmarks: np.ndarray) -> None:
+        """Add landmarks to the detected face object. If landmarks already exist, they will be
+        overwritten.
+
+        Parameters
+        ----------
+        landmarks
+            The 68 point face landmarks to add for the face
+        """
+        logger.trace("landmarks shape: '%s'", landmarks.shape)  # type:ignore[attr-defined]
+        self._landmarks_xy = landmarks
+
+    def add_identity(self, name: str, embedding: np.ndarray, ) -> None:
+        """Add an identity embedding to this detected face. If an identity already exists for the
+        given :attr:`name` it will be overwritten
+
+        Parameters
+        ----------
+        name
+            The name of the mechanism that calculated the identity
+        embedding
+            The identity embedding
+        """
+        logger.trace("name: '%s', embedding shape: %s",  # type:ignore[attr-defined]
+                     name, embedding.shape)
+        self._identity[name] = embedding
+
+    def clear_all_identities(self) -> None:
+        """Remove all stored identity embeddings """
+        self._identity = {}
+
+    def get_landmark_mask(self,
+                          area: T.Literal["eye", "mouth", "face", "face_extended"],
+                          dilation: float = 0,
+                          blur_kernel: int = 0,
+                          blur_type: T.Literal["gaussian", "normalized"] | None = "gaussian",
+                          blur_passes: int = 1) -> npt.NDArray[np.uint8]:
+        """Obtain a :class:`~lib.align.aligned_mask.LandmarksMask` for this face
+
+        Landmark based masks are generated from Aligned Face landmark points. An aligned face must
+        be loaded. As the data is coming from the already aligned face, no further mask cropping is
+        required.
+
+        Parameters
+        ----------
+        area
+            The type of mask to obtain. `face` is a full face mask, `face_extended` is a face mask
+            that extends above the eyebrows. The others are masks for those specific areas
+        dilation
+            The amount of dilation to apply to the mask. as a percentage of the mask size.
+            Default: 0
+        blur_kernel
+            The kernel size, in pixels to apply gaussian blurring to the mask. Set to 0 for no
+            blurring. Should be odd, if an even number is passed in (outside of 0) then it is
+            rounded up to the next odd number. Default: 0
+        blur_type
+            The blur type to use. ``gaussian`` or ``normalized`` box filter. Default: ``gaussian``
+        blur_passes
+            The number of passed to perform when blurring. Default: 1
+
+        Returns
+        -------
+        The generated landmarks mask for the selected area
+        """
+        return self.aligned.get_landmark_mask(area,
+                                              dilation=dilation,
+                                              blur_kernel=blur_kernel,
+                                              blur_type=blur_type,
+                                              blur_passes=blur_passes)
+
+    def store_training_masks(self,
+                             masks: list[np.ndarray | None],
+                             delete_masks: bool = False) -> None:
+        """Concatenate and compress the given training masks and store for retrieval.
+
+        Parameters
+        ----------
+        masks : list[ | None]
+            A list of training mask. Must be all be uint-8 3D arrays of the same size in
+            0-255 range
+        delete_masks
+            ``True`` to delete any of the :class:`~lib.align.aligned_mask.Mask` objects owned by
+            this detected face. Use to free up non-required memory usage. Default: ``False``
+        """
+        if delete_masks:
+            del self.mask
+            self.mask = {}
+
+        valid = [msk for msk in masks if msk is not None]
+        if not valid:
+            return
+        combined = np.concatenate(valid, axis=-1)
+        self._training_masks = (compress(combined), T.cast(tuple[int, int, int], combined.shape))
+
+    def get_training_masks(self) -> np.ndarray | None:
+        """Obtain the decompressed combined training masks.
+
+        Returns
+        -------
+        A 3D array containing the decompressed training masks as uint8 in 0-255 range if
+        training masks are present otherwise ``None``
+        """
+        if not self._training_masks:
+            return None
+        return np.frombuffer(decompress(self._training_masks[0]),
+                             dtype="uint8").reshape(self._training_masks[1])
+
+    def to_alignment(self) -> FileAlignments:
+        """ Return the detected face formatted for an alignments file
+
+        Returns
+        -------
+        The alignment dict will be returned with the keys ``x``, ``w``, ``y``, ``h``,
+        ``landmarks_xy``, ``mask``. The additional key ``thumb`` will be provided if the
+        detected face object contains a thumbnail.
+        """
+        if (self.left is None or self.width is None or self.top is None or self.height is None):
+            raise AssertionError("Some detected face variables have not been initialized")
+        thumb = None if self.thumbnail is None else self.thumbnail.tolist()
+        alignment = FileAlignments(x=self.left,
+                                   w=self.width,
+                                   y=self.top,
+                                   h=self.height,
+                                   landmarks_xy=self.landmarks_xy.tolist(),
+                                   mask={name: mask.to_dict()
+                                         for name, mask in self.mask.items()},
+                                   identity=self._identity,
+                                   thumb=thumb)
+        logger.trace("Returning: %s", alignment)  # type:ignore[attr-defined]
+        return alignment
+
+    def from_alignment(self, alignment: FileAlignments | PNGAlignments,
+                       image: np.ndarray | None = None, with_thumb: bool = False) -> T.Self:
+        """Set the attributes of this class from an alignments file and optionally load the face
+        into the ``image`` attribute.
+
+        Parameters
+        ----------
+        alignment
+            The alignment object to obtain the alignments from
+        image
+            If an image is passed in, then the ``image`` attribute will
+            be set to the cropped face based on the passed in bounding box co-ordinates
+        with_thumb
+            Whether to load the jpg thumbnail into the detected face object, if provided.
+            Default: ``False``
+
+        Returns
+        -------
+        This DetectedFace object populated by the incoming alignment dict
+        """
+
+        logger.trace("Creating from alignment: (alignment: %s,"  # type:ignore[attr-defined]
+                     " has_image: %s)", alignment, bool(image is not None))
+        self.left = alignment.x
+        self.width = alignment.w
+        self.top = alignment.y
+        self.height = alignment.h
+        self._identity = alignment.identity
+        self._landmarks_xy = alignment.landmarks_xy
+        if with_thumb and isinstance(alignment, FileAlignments):
+            self.thumbnail = alignment.thumb
+
+        # Manual tool and legacy alignments will not have a mask
+        self._aligned = None
+
+        if alignment.mask:
+            self.mask = {}
+            for name, mask in alignment.mask.items():
+                if name in ("components", "extended"):
+                    continue  # Skip legacy stored LM based masks
+                self.mask[name] = aligned_mask.Mask()
+                self.mask[name].from_dict(mask)
+        if image is not None and image.any():
+            self._image_to_face(image)
+        logger.trace("Created from alignment: (left: %s, width: %s, "  # type:ignore[attr-defined]
+                     "top: %s, height: %s, landmarks: %s, mask: %s)",
+                     self.left, self.width, self.top, self.height, self.landmarks_xy, self.mask)
+        return self
+
+    def to_png_meta(self) -> PNGAlignments:
+        """Return the detected face formatted for insertion into a png itxt header.
+
+        Returns
+        -------
+        The alignments dict will be returned with the keys ``x``, ``w``, ``y``, ``h``,
+        ``landmarks_xy`` and ``mask``
+        """
+        if (self.left is None or self.width is None or self.top is None or self.height is None):
+            raise AssertionError("Some detected face variables have not been initialized")
+        alignment = PNGAlignments(
+            x=self.left,
+            w=self.width,
+            y=self.top,
+            h=self.height,
+            landmarks_xy=self.landmarks_xy.tolist(),
+            mask={name: mask.to_png_meta() for name, mask in self.mask.items()},
+            identity=self._identity)
+        return alignment
+
+    def from_png_meta(self, alignment: PNGAlignments) -> T.Self:
+        """Set the attributes of this class from alignments stored in a png exif header.
+
+        Parameters
+        ----------
+        alignment
+            A dictionary entry for a face from alignments stored in a png exif header containing
+            the keys ``x``, ``w``, ``y``, ``h``, ``landmarks_xy`` and ``mask``
+        """
+        self.left = alignment.x
+        self.width = alignment.w
+        self.top = alignment.y
+        self.height = alignment.h
+        self._landmarks_xy = alignment.landmarks_xy
+        self.mask = {}
+        for name, mask_dict in alignment.mask.items():
+            if name in ("components", "extended"):
+                continue  # Skip legacy stored LM based masks
+            self.mask[name] = aligned_mask.Mask()
+            self.mask[name].from_dict(mask_dict)
+        self._identity = {}
+        for key, val in alignment.identity.items():
+            self._identity[key] = np.array(val, dtype="float32")
+        logger.trace("Created from png exif header: (left: %s, "  # type:ignore[attr-defined]
+                     "width: %s, top: %s  height: %s, landmarks: %s, mask: %s, identity: %s)",
+                     self.left, self.width, self.top, self.height, self.landmarks_xy, self.mask,
+                     {k: v.shape for k, v in self._identity.items()})
+        return self
+
+    def _image_to_face(self, image: np.ndarray) -> None:
+        """set self.image to be the cropped face from detected bounding box
+
+        Parameters
+        ----------
+        image
+            The image to be cropped
+        """
+        logger.trace("Cropping face from image")  # type:ignore[attr-defined]
+        self.image = image[self.top: self.bottom,
+                           self.left: self.right]
+
+    # <<< Aligned Face methods and properties >>> #
+    def load_aligned(self,
+                     image: np.ndarray | None,
+                     size: int = 256,
+                     dtype: str | None = None,
+                     centering: CenteringType = "head",
+                     coverage_ratio: float = 1.0,
+                     y_offset: float = 0.0,
+                     force: bool = False,
+                     is_aligned: bool = False,
+                     is_legacy: bool = False) -> None:
+        """Align a face from a given image.
+
+        Aligning a face is a relatively expensive task and is not required for all uses of
+        the :class:`~lib.align.DetectedFace` object, so call this function explicitly to
+        load an aligned face.
+
+        This method plugs into :mod:`lib.align.AlignedFace` to perform face alignment based on this
+        face's ``landmarks_xy``. If the face has already been aligned, then this function will
+        return having performed no action.
+
+        Parameters
+        ----------
+        image
+            The image that contains the face to be aligned. Default: ``None``
+        size
+            The size of the output face in pixels. Default: `256`
+        dtype
+            Optionally set a ``dtype`` for the final face to be formatted in. Default: ``None``
+        centering : Literal["legacy", "face", "head"]
+            The type of extracted face that should be loaded. "legacy" places the nose in the
+            center of the image (the original method for aligning). "face" aligns for the nose to
+            be in the center of the face (top to bottom) but the center of the skull for left to
+            right. "head" aligns for the center of the skull (in 3D space) being the center of the
+            extracted image, with the crop holding the full head.
+            Default: `"head"`
+        coverage_ratio
+            The amount of the aligned image to return. A ratio of 1.0 will return the full contents
+            of the aligned image. A ratio of 0.5 will return an image of the given size, but will
+            crop to the central 50%% of the image. Default: `1.0`
+        y_offset
+            The amount to adjust the aligned face along the y_axis in -1. to 1. range.
+            Default: `0.0`
+        force
+            Force an update of the aligned face, even if it is already loaded. Default: ``False``
+        is_aligned
+            Indicates that the :attr:`image` is an aligned face rather than a frame.
+            Default: ``False``
+        is_legacy
+            Only used if `is_aligned` is ``True``. ``True`` indicates that the aligned image being
+            loaded is a legacy extracted face rather than a current head extracted face
+
+        Notes
+        -----
+        This method must be executed to get access to the following a
+        :class:`lib.align.aligned_face.AlignedFace` object
+        """
+        if self._aligned and not force:
+            # Don't reload an already aligned face
+            logger.trace("Skipping alignment calculation for already "  # type:ignore[attr-defined]
+                         "aligned face")
+        else:
+            logger.trace("Loading aligned face: (size: %s, "  # type:ignore[attr-defined]
+                         "dtype: %s)", size, dtype)
+            self._aligned = AlignedFace(self.landmarks_xy,
+                                        image=image,
+                                        centering=centering,
+                                        size=size,
+                                        coverage_ratio=coverage_ratio,
+                                        y_offset=y_offset,
+                                        dtype=dtype,
+                                        is_aligned=is_aligned,
+                                        is_legacy=is_aligned and is_legacy)
+
+
+__all__ = get_module_objects(__name__)

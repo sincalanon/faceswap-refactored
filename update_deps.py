@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+""" Installs any required third party libs for faceswap.py
+
+    Checks for installed Conda / Pip packages and updates accordingly
+"""
+import logging
+import os
+import sys
+
+from lib.logger import log_setup
+from lib.utils import get_module_objects
+from setup import Environment, Install
+
+logger = logging.getLogger(__name__)
+
+
+def update(is_gui=False) -> None:
+    """ Check for and update dependencies
+
+    Parameters
+    ----------
+    is_gui: bool, optional
+        ``True`` if being called by the GUI. Prevents the updater from outputting progress bars
+        which get scrambled in the GUI
+    """
+    logger.info("Updating dependencies...")
+    updater = Environment(updater=True)
+    Install(updater, is_gui=is_gui)
+    logger.info("Dependencies updated")
+
+
+if __name__ == "__main__":
+    logfile = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), "faceswap_update.log")
+    log_setup("INFO", logfile, "setup")
+    update()
+
+
+__all__ = get_module_objects(__name__)

@@ -1,0 +1,61 @@
+[tool.flake8]
+max-line-length = 99
+max-complexity=10
+statistics = true
+count = true
+exclude = [".git", "__pycache__"]
+per-file-ignores = ["__init__.py:F401"]
+
+[tool.ruff]
+# Mirrors the flake8 settings above so that both linters agree
+line-length = 99
+target-version = "py311"
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "C90", "UP039", "PIE808", "PIE790", "UP034", "C413"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+# Fixtures imported from helper modules are consumed by pytest via argument names
+"tests/**" = ["F401", "F811"]
+
+[tool.pylint.DESIGN]
+min-public-methods = 1
+max-args = 10
+max-attributes = 10
+max-positional-arguments = 10
+
+[tool.pylint.TYPECHECK]
+generated-members = ["av", "cv2", "event_pb2.*"]
+
+[[tool.mypy.overrides]]
+module = [
+    "fastcluster.*",
+    "ffmpeg.*",
+    "ffmpy.*",
+    "h5py.*",
+    "keras.*",
+    "numexpr.*",
+    "pexpect.*",
+    "pynvml.*",
+    "scipy.*",
+    "sklearn.*",
+    "tensorboard.*",
+    "torch.*",
+    "torchvision.*",
+    "tqdm.*",
+    "win32console.*",
+    "winpty.*",]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["ignore::DeprecationWarning:keras.*:"]
+
+[tool.pyright]
+reportUnsupportedDunderAll = false

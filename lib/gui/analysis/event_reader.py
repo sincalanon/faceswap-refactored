@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""Handles the loading and collation of events from Tensorboard event log files."""
+from __future__ import annotations
+import logging
+import os
+import typing as T
+import zlib
+
+from dataclasses import dataclass, field
+
+import numpy as np
+from tensorboard.compat.proto import event_pb2  # type:ignore[import-untyped]
+
+from lib.logger import parse_class_init
+from lib.training.tensorboard import RecordIterator
+from lib.utils import get_module_objects
+
+if T.TYPE_CHECKING:
+    from collections.abc import Generator, Iterator
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EventData:
+    """Holds data collected from Tensorboard Event Files
+
+    Parameters
+    ----------
+    timestamp
+        The timestamp of the event step (iteration)
+    loss
+        The loss values collected for A and B sides for the event step
+    """
+    timestamp: float = 0.0
+    loss: list[float] = field(default_factory=list)
+
+
+class _LogFiles:
+    """Holds the filenames of the Tensorboard Event logs that require parsing.
+
+    Parameters
+    ----------
+    logs_folder
+        The folder that contains the Tensorboard log files
+    """
+    def __init__(self, logs_folder: str) -> None:
+        logger.debug(parse_class_init(locals()))
+        self._logs_folder = logs_folder
+        self._filenames = self._get_log_filenames()
+
+    @property
+    def session_ids(self) -> list[int]:
+        """Sorted list of `ints` of available session ids."""
+        return sorted(self._filenames)
+
+    def _get_log_filenames(self) -> dict[int, str]:
+        """Get the Tensorboard event filenames for all existing sessions.
+
+        Returns
+        -------
+        The full path of each log file for each training session id that has been run
+        """
+        logger.debug("[LogFiles] Loading log filenames. base_dir: '%s'", self._logs_folder)
+        retval: dict[int, str] = {}
+        for dirpath, _, filenames in os.walk(self._logs_folder):
+            if not any(filename.startswith("events.out.tfevents") for filename in filenames):
+                continue
+            session_id = self._get_session_id(dirpath)
+            if session_id is None:
+                logger.warning("Unable to load session data for model")
+                return retval
+            retval[session_id] = self._get_log_filename(dirpath, filenames)
+        logger.debug("[LogFiles] log_files: %s", retval)
+        return retval
+
+    @classmethod
+    def _get_session_id(cls, folder: str) -> int | None:
+        """Obtain the session id for the given folder.
+
+        Parameters
+        ----------
+        folder
+            The full path to the folder that contains the session's Tensorboard Event Log
+
+        Returns
+        -------
+        The session ID for the given folder. If no session id can be determined, return ``None``
+        """
+        session = os.path.split(os.path.split(folder)[0])[1]
+        session_id = session[session.rfind("_") + 1:]
+        retval = None if not session_id.isdigit() else int(session_id)
+        logger.debug("[LogFiles] folder: '%s', session_id: %s", folder, retval)
+        return retval
+
+    @classmethod
+    def _get_log_filename(cls, folder: str, filenames: list[str]) -> str:
+        """Obtain the session log file for the given folder. If multiple log files exist for the
+        given folder, then the most recent log file is used, as earlier files are assumed to be
+        obsolete.
+
+        Parameters
+        ----------
+        folder
+            The full path to the folder that contains the session's Tensorboard Event Log
+        filenames
+            List of filenames that exist within the given folder
+
+        Returns
+        -------
+        The full path of the selected log file
+        """
+        log_files = [fname for fname in filenames if fname.startswith("events.out.tfevents")]
+        retval = os.path.join(folder, sorted(log_files)[-1])  # Take last item if multi matches
+        logger.debug("[LogFiles] log_files: %s, selected: '%s'", log_files, retval)
+        return retval
+
+    def refresh(self) -> bool:
+        """Refresh the list of log filenames.
+
+        Returns
+        -------
+        ``True`` if the pre-existing log files are a subset of the new log files, otherwise
+        ``False``
+        """
+        logger.debug("[LogFiles] Refreshing log filenames")
+        old_filenames = self._filenames
+        new_filenames = self._get_log_filenames()
+        retval = set(old_filenames.values()).issubset(set(new_filenames.values()))
+        self._filenames = new_filenames
+        logger.debug("[LogFiles] old filenames are %sa subset of new filenames %s",
+                     "" if retval else "not ", self._filenames)
+        return retval
+
+    def get(self, session_id: int) -> str:
+        """Obtain the log filename for the given session id.
+
+        Parameters
+        ----------
+        session_id
+            The session id to obtain the log filename for
+
+        Returns
+        -------
+        The full path to the log file for the requested session id
+        """
+        retval = self._filenames.get(session_id, "")
+        logger.debug("[LogFiles] session_id: %s, log_filename: '%s'", session_id, retval)
+        return retval
+
+
+class _CacheData:
+    """Holds cached data that has been retrieved from Tensorboard Event Files and is compressed
+    in memory for a single or live training session
+
+    Parameters
+    ----------
+    labels
+        The labels for the loss values
+    timestamps
+        The timestamp of the event step (iteration)
+    loss
+        The loss values collected for A and B sides for the session
+    """
+    def __init__(self, labels: list[str], timestamps: np.ndarray, loss: np.ndarray) -> None:
+        self.labels = labels
+        self._loss = zlib.compress(T.cast(bytes, loss))
+        self._timestamps = zlib.compress(T.cast(bytes, timestamps))
+        self._timestamps_shape = timestamps.shape
+        self._loss_shape = loss.shape
+
+    @property
+    def loss(self) -> np.ndarray:
+        """The loss values for this session"""
+        retval: np.ndarray = np.frombuffer(zlib.decompress(self._loss), dtype="float32")
+        if len(self._loss_shape) > 1:
+            retval = retval.reshape(-1, *self._loss_shape[1:])
+        return retval
+
+    @property
+    def timestamps(self) -> np.ndarray:
+        """The timestamps for this session"""
+        retval: np.ndarray = np.frombuffer(zlib.decompress(self._timestamps), dtype="float64")
+        if len(self._timestamps_shape) > 1:
+            retval = retval.reshape(-1, *self._timestamps_shape[1:])
+        return retval
+
+    def add_live_data(self, timestamps: np.ndarray, loss: np.ndarray) -> None:
+        """Add live data to the end of the stored data
+
+        loss
+            The latest loss values to add to the cache
+        timestamps
+            The latest timestamps  to add to the cache
+        """
+        new_buffer: list[bytes] = []
+        new_shapes: list[tuple[int, ...]] = []
+        for data, buffer, dtype, shape in zip([timestamps, loss],
+                                              [self._timestamps, self._loss],
+                                              ["float64", "float32"],
+                                              [self._timestamps_shape, self._loss_shape]):
+
+            old = np.frombuffer(zlib.decompress(buffer), dtype=dtype)
+            if data.ndim > 1:
+                old = old.reshape(-1, *data.shape[1:])
+
+            new = np.concatenate((old, data))
+
+            logger.debug("[CacheData] old_shape: %s new_shape: %s", shape, new.shape)
+            new_buffer.append(zlib.compress(new))
+            new_shapes.append(new.shape)
+            del old
+
+        self._timestamps = new_buffer[0]
+        self._loss = new_buffer[1]
+        self._timestamps_shape = new_shapes[0]
+        self._loss_shape = new_shapes[1]
+
+
+class _Cache:
+    """Holds parsed Tensorboard log event data in a compressed cache in memory."""
+    def __init__(self) -> None:
+        logger.debug(parse_class_init(locals()))
+        self._data: dict[int, _CacheData] = {}
+        self._carry_over: dict[int, EventData] = {}
+        self._loss_labels: list[str] = []
+
+    def is_cached(self, session_id: int) -> bool:
+        """Check if the given session_id's data is already cached
+
+        Parameters
+        ----------
+        session_id
+            The session ID to check
+
+        Returns
+        -------
+        ``True`` if the data already exists in the cache otherwise ``False``.
+        """
+        return self._data.get(session_id) is not None
+
+    def cache_data(self,
+                   session_id: int,
+                   data: dict[int, EventData],
+                   labels: list[str],
+                   is_live: bool = False) -> None:
+        """Add a full session's worth of event data to :attr:`_data`.
+
+        Parameters
+        ----------
+        session_id
+            The session id to add the data for
+        data
+            The extracted event data dictionary generated from :class:`_EventParser`
+        labels
+            List of `str` for the labels of each loss value output
+        is_live
+            ``True`` if the data to be cached is from a live training session otherwise ``False``.
+            Default: ``False``
+        """
+        logger.debug("[Cache] Caching event data: (session_id: %s, labels: %s, data points: %s, "
+                     "is_live: %s)", session_id, labels, len(data), is_live)
+
+        if labels:
+            logger.debug("[Cache] Setting loss labels: %s", labels)
+            self._loss_labels = labels
+
+        if not data:
+            logger.debug("[Cache] No data to cache")
+            return
+
+        timestamps, loss = self._to_numpy(data, is_live)
+
+        if not is_live or (is_live and not self._data.get(session_id)):
+            self._data[session_id] = _CacheData(self._loss_labels, timestamps, loss)
+        else:
+            self._add_latest_live(session_id, loss, timestamps)
+
+    def _to_numpy(self,
+                  data: dict[int, EventData],
+                  is_live: bool) -> tuple[np.ndarray, np.ndarray]:
+        """Extract each individual step data into separate numpy arrays for loss and timestamps.
+
+        Timestamps are stored float64 as the extra accuracy is needed for correct timings. Arrays
+        are returned at the length of the shortest available data (i.e. truncated records are
+        dropped)
+
+        Parameters
+        ----------
+        data
+            The incoming Tensorboard event data in dictionary form per step
+        is_live
+            ``True`` if the data to be cached is from a live training session otherwise ``False``.
+            Default: ``False``
+
+        Returns
+        -------
+        timestamps
+            float64 array of all iteration's timestamps
+        loss
+            float32 array of all iteration's loss
+        """
+        if is_live and self._carry_over:
+            logger.debug("[Cache] Processing carry over: %s", self._carry_over)
+            self._collect_carry_over(data)
+
+        times, loss = self._process_data(data, is_live)
+
+        if is_live and not all(len(val) == len(self._loss_labels) for val in loss):
+            # TODO Many attempts have been made to fix this for live graph logging, and the issue
+            # of non-consistent loss record sizes keeps coming up. In the meantime we shall swallow
+            # any loss values that are of incorrect length so graph remains functional. This will,
+            # most likely, lead to a mismatch on iteration count so a proper fix should be
+            # implemented.
+
+            # Timestamps and loss appears to remain consistent with each other, but sometimes loss
+            # appears non-consistent. eg (lengths):
+            # [2, 2, 2, 2, 2, 2, 2, 0] - last loss collection has zero length
+            # [1, 2, 2, 2, 2, 2, 2, 2] - 1st loss collection has 1 length
+            # [2, 2, 2, 3, 2, 2, 2] - 4th loss collection has 3 length
+
+            logger.debug("[Cache] Inconsistent loss found in collection: %s", loss)
+            for idx in reversed(range(len(loss))):
+                if len(loss[idx]) != len(self._loss_labels):
+                    logger.debug("[Cache] Removing loss/timestamps at position %s", idx)
+                    del loss[idx]
+                    del times[idx]
+
+        n_times, n_loss = (np.array(times, dtype="float64"), np.array(loss, dtype="float32"))
+        logger.debug("[Cache] Converted to numpy: (data points: %s, timestamps shape: %s, "
+                     "loss shape: %s)",
+                     len(data), n_times.shape, n_loss.shape)
+
+        return n_times, n_loss
+
+    def _collect_carry_over(self, data: dict[int, EventData]) -> None:
+        """For live data, collect carried over data from the previous update and merge into the
+        current data dictionary.
+
+        Parameters
+        ----------
+        data
+            The latest raw data dictionary
+        """
+        logger.debug("[Cache] Carry over keys: %s, data keys: %s",
+                     list(self._carry_over), list(data))
+        for key in list(self._carry_over):
+            if key not in data:
+                logger.debug("[Cache] Carry over found for item %s which does not exist in "
+                             "current data: %s. Skipping.", key, list(data))
+                continue
+            carry_over = self._carry_over.pop(key)
+            update = data[key]
+            logger.debug("[Cache] Merging carry over data: %s in to %s", carry_over, update)
+            timestamp = update.timestamp
+            update.timestamp = carry_over.timestamp if not timestamp else timestamp
+            update.loss = carry_over.loss + update.loss
+            logger.debug("[Cache] Merged carry over data: %s", update)
+
+    def _process_data(self,
+                      data: dict[int, EventData],
+                      is_live: bool) -> tuple[list[float], list[list[float]]]:
+        """Process live update data.
+
+        Live data requires different processing as often we will only have partial data for the
+        current step, so we need to cache carried over partial data to be picked up at the next
+        query. In addition to this, if training is unexpectedly interrupted, there may also be
+        partial data which needs to be cleansed prior to creating a numpy array
+
+        Parameters
+        ----------
+        data
+            The incoming Tensorboard event data in dictionary form per step
+        is_live
+            ``True`` if the data to be cached is from a live training session otherwise ``False``.
+
+        Returns
+        -------
+        timestamps
+            Cleaned list of complete timestamps for the latest live query
+        loss
+            Cleaned list of complete loss for the latest live query
+        """
+        timestamps, loss = zip(*[(data[idx].timestamp, data[idx].loss)
+                               for idx in sorted(data)])
+
+        l_loss: list[list[float]] = list(loss)
+        l_timestamps: list[float] = list(timestamps)
+
+        if len(l_loss[-1]) != len(self._loss_labels):
+            logger.debug("[Cache] Truncated loss found. loss count: %s", len(l_loss))
+            idx = sorted(data)[-1]
+            if is_live:
+                logger.debug("[Cache] Setting carried over data: %s", data[idx])
+                self._carry_over[idx] = data[idx]
+            logger.debug("[Cache] Removing truncated loss: (timestamp: %s, loss: %s)",
+                         l_timestamps[-1], loss[-1])
+            del l_loss[-1]
+            del l_timestamps[-1]
+
+        return l_timestamps, l_loss
+
+    def _add_latest_live(self, session_id: int, loss: np.ndarray, timestamps: np.ndarray) -> None:
+        """Append the latest received live training data to the cached data.
+
+        Parameters
+        ----------
+        session_id
+            The training session ID to update the cache for
+        loss
+            The latest loss values returned from the iterator
+        timestamps
+            The latest time stamps returned from the iterator
+        """
+        logger.debug("[Cache] Adding live data to cache: "
+                     "(session_id: %s, loss: %s, timestamps: %s)",
+                     session_id, loss.shape, timestamps.shape)
+        if not np.any(loss) and not np.any(timestamps):
+            return
+
+        self._data[session_id].add_live_data(timestamps, loss)
+
+    def get_data(self, session_id: int | None, metric: T.Literal["loss", "timestamps"]
+                 ) -> dict[int, dict[str, np.ndarray | list[str]]] | None:
+        """Retrieve the decompressed cached data from the cache for the given session id.
+
+        Parameters
+        ----------
+        session_id
+            If session_id is provided, then the cached data for that session is returned. If
+            session_id is ``None`` then the cached data for all sessions is returned
+        metric
+            The metric to return the data for.
+
+        Returns
+        -------
+        The `session_id`(s) as key, the values are a dictionary containing the requested metric
+        information for each session returned. ``None`` if no data is stored for the given
+        session_id
+        """
+        if session_id is None:
+            raw = self._data
+        else:
+            data = self._data.get(session_id)
+            if not data:
+                return None
+            raw = {session_id: data}
+
+        retval: dict[int, dict[str, np.ndarray | list[str]]] = {}
+        for idx, data in raw.items():
+            array = data.loss if metric == "loss" else data.timestamps
+            val: dict[str, np.ndarray | list[str]] = {str(metric): array}
+            if metric == "loss":
+                val["labels"] = data.labels
+            retval[idx] = val
+
+        logger.debug("[Cache] Obtained cached data: %s",
+                     {session_id: {k: v.shape if isinstance(v, np.ndarray) else v
+                                   for k, v in data.items()}
+                      for session_id, data in retval.items()})
+        return retval
+
+    def reset(self) -> None:
+        """Remove all information stored within the cache and reset to default"""
+        logger.debug("[Cache] Resetting cache")
+        del self._data
+        del self._carry_over
+        del self._loss_labels
+        self._data = {}
+        self._carry_over = {}
+        self._loss_labels = []
+
+
+class TensorBoardLogs:
+    """Parse data from TensorBoard logs.
+
+    Process the input logs folder and stores the individual filenames per session.
+
+    Caches timestamp and loss data on request and returns this data from the cache.
+
+    Parameters
+    ----------
+    logs_folder
+        The folder that contains the Tensorboard log files
+    is_training
+        ``True`` if the events are being read whilst Faceswap is training otherwise ``False``
+    """
+    def __init__(self, logs_folder: str, is_training: bool) -> None:
+        logger.debug(parse_class_init(locals()))
+        self._is_training = False
+        self._training_iterator: RecordIterator | None = None
+
+        self._log_files = _LogFiles(logs_folder)
+        self._cache = _Cache()
+        self.set_training(is_training)
+
+    @property
+    def session_ids(self) -> list[int]:
+        """Sorted list of integers of available session ids."""
+        return self._log_files.session_ids
+
+    def set_training(self, is_training: bool) -> bool:
+        """Set the internal training flag to the given `is_training` value.
+
+        If a new training session is being instigated, refresh the log filenames
+
+        Parameters
+        ----------
+        is_training
+            ``True`` to indicate that the logs to be read are from the currently training
+            session otherwise ``False``
+
+        Returns
+        -------
+        ``True`` if the session that is starting training belongs to the session already loaded
+        otherwise ``False``
+        """
+        retval = True
+        if self._is_training == is_training:
+            logger.debug("[Cache] Training flag already set to %s. Returning", is_training)
+            return retval
+
+        logger.debug("[Cache] Setting is_training to %s", is_training)
+        self._is_training = is_training
+        if is_training:
+            retval = self._log_files.refresh()
+            if not retval:
+                self._cache.reset()
+            log_file = self._log_files.get(self.session_ids[-1])
+            logger.debug("[Cache] Setting training iterator for log file: '%s'", log_file)
+            self._training_iterator = RecordIterator(log_file, is_live=True)
+        else:
+            logger.debug("[Cache] Removing training iterator")
+            del self._training_iterator
+            self._training_iterator = None
+        return retval
+
+    def _cache_data(self, session_id: int) -> None:
+        """Cache TensorBoard logs for the given session ID on first access.
+
+        Populates :attr:`_cache` with timestamps and loss data.
+
+        If this is a training session and the data is being queried for the training session ID
+        then get the latest available data and append to the cache
+
+        Parameters
+        -------
+        session_id
+            The session ID to cache the data for
+        """
+        live_data = self._is_training and session_id == max(self.session_ids)
+        iterator = self._training_iterator if live_data else RecordIterator(
+            self._log_files.get(session_id))
+        assert iterator is not None
+        parser = _EventParser(iterator, self._cache, live_data)
+        parser.cache_events(session_id)
+
+    def _check_cache(self, session_id: int | None = None) -> None:
+        """Check if the given session_id has been cached and if not, cache it.
+
+        Parameters
+        ----------
+        session_id
+            The Session ID to return the data for. Set to ``None`` to return all session
+            data. Default ``None`
+        """
+        if session_id is not None and not self._cache.is_cached(session_id):
+            self._cache_data(session_id)
+        elif self._is_training and session_id is not None and session_id == self.session_ids[-1]:
+            self._cache_data(session_id)
+        elif session_id is None:
+            for idx in self.session_ids:
+                if not self._cache.is_cached(idx):
+                    self._cache_data(idx)
+
+    def get_loss(self, session_id: int | None = None) -> dict[int, dict[str, np.ndarray]]:
+        """Read the loss from the TensorBoard event logs
+
+        Parameters
+        ----------
+        session_id
+            The Session ID to return the loss for. Set to ``None`` to return all session
+            losses. Default ``None``
+
+        Returns
+        -------
+        The session id(s) as key, with a further dictionary as value containing the loss name and
+        list of loss values for each step
+        """
+        logger.debug("[TensorBoardLogs] Getting loss: (session_id: %s)", session_id)
+        retval: dict[int, dict[str, np.ndarray]] = {}
+        for idx in [session_id] if session_id else self.session_ids:
+            self._check_cache(idx)
+            full_data = self._cache.get_data(idx, "loss")
+            if not full_data:
+                continue
+            data = full_data[idx]
+            loss = data["loss"]
+            assert isinstance(loss, np.ndarray)
+            retval[idx] = {title: loss[:, idx] for idx, title in enumerate(data["labels"])}
+
+        logger.debug("[TensorBoardLogs] %s", {key: {k: v.shape for k, v in val.items()}
+                                              for key, val in retval.items()})
+        return retval
+
+    def get_timestamps(self, session_id: int | None = None) -> dict[int, np.ndarray]:
+        """Read the timestamps from the TensorBoard logs.
+
+        As loss timestamps are slightly different for each loss, we collect the timestamp from the
+        `batch_loss` key.
+
+        Parameters
+        ----------
+        session_id
+            The Session ID to return the timestamps for. Set to ``None`` to return all session
+            timestamps. Default ``None``
+
+        Returns
+        -------
+        The session id(s) as key with list of timestamps per step as value
+        """
+
+        logger.debug("[TensorBoardLogs] Getting timestamps: (session_id: %s, is_training: %s)",
+                     session_id, self._is_training)
+        retval: dict[int, np.ndarray] = {}
+        for idx in [session_id] if session_id else self.session_ids:
+            self._check_cache(idx)
+            data = self._cache.get_data(idx, "timestamps")
+            if not data:
+                continue
+            timestamps = data[idx]["timestamps"]
+            assert isinstance(timestamps, np.ndarray)
+            retval[idx] = timestamps
+        logger.debug("[TensorBoardLogs] %s", {k: v.shape for k, v in retval.items()})
+        return retval
+
+
+class _EventParser:
+    """Parses Tensorboard event and populates data to :class:`_Cache`.
+
+    Parameters
+    ----------
+    iterator
+        The iterator to use for reading Tensorboard event logs
+    cache
+        The cache object to store the collected parsed events to
+    live_data
+        ``True`` if the iterator to be loaded is a training iterator for reading live data
+        otherwise ``False``
+    """
+    def __init__(self, iterator: Iterator[bytes], cache: _Cache, live_data: bool) -> None:
+        logger.debug(parse_class_init(locals()))
+        self._live_data = live_data
+        self._cache = cache
+        self._iterator = self._get_latest_live(iterator) if live_data else iterator
+
+    @classmethod
+    def _get_latest_live(cls, iterator: Iterator[bytes]) -> Generator[bytes, None, None]:
+        """Obtain the latest event logs for live training data.
+
+        The live data iterator remains open so that it can be re-queried
+
+        Parameters
+        ----------
+        iterator
+            The live training iterator to use for reading Tensorboard event logs
+
+        Yields
+        ------
+        A Tensorboard event in dictionary form for a single step
+        """
+        i = 0
+        while True:
+            try:
+                yield next(iterator)
+                i += 1
+            except StopIteration:
+                logger.debug("[EventParser] End of data reached")
+                break
+        logger.debug("[EventParser] Collected %s records from live log file", i)
+
+    @classmethod
+    def _process_event(cls,
+                       event: event_pb2.Event,  # pyright:ignore[reportInvalidTypeForm]
+                       step: EventData) -> EventData:
+        """Process a single Tensorboard event.
+
+        Adds timestamp to the step `dict` if a total loss value is received, process the labels for
+        any new loss entries and adds the side loss value to the step `dict`.
+
+        Parameters
+        ----------
+        event
+            The event data to be processed
+        step
+            The currently processing dictionary to be populated with the extracted data from the
+            Tensorboard event for this step
+
+        Returns
+        -------
+         The given step :class:`EventData` with the given event data added to it.
+        """
+        summary = event.summary.value[0]
+
+        if summary.tag == "batch_total":
+            step.timestamp = event.wall_time
+            return step
+
+        loss = summary.simple_value
+        if not loss:
+            # Need to convert a tensor to a float for TF2.8 logged data. This maybe due to change
+            # in logging or may be due to work around put in place in FS training function for the
+            # following bug in TF 2.8/2.9 when writing records:
+            #  https://github.com/keras-team/keras/issues/16173
+            loss = float(np.frombuffer(summary.tensor.tensor_content, dtype="float32"))
+
+        step.loss.append(loss)
+
+        return step
+
+    @classmethod
+    def _format_tags(cls, tags: list[str]) -> list[str]:
+        """Format the raw tags from log files to display names
+
+        Parameters
+        ----------
+        tags
+            The raw tags extracted from a tensorboard log file
+
+        Returns
+        -------
+        The tags formatted for display
+        """
+        formatted = [t[6:] for t in tags]
+        formatted = [t[0].upper() + t[1:] for t in formatted]
+        for idx, tag in enumerate(formatted):
+            if "/" in tag:
+                category, loss_name = tag.split("/", maxsplit=1)
+                formatted[idx] = f"{category}-{loss_name.upper()}"
+        logger.trace("[EventParser] Formatted tags from %s to %s",  # type:ignore[attr-defined]
+                     tags, formatted)
+        return formatted
+
+    def cache_events(self, session_id: int) -> None:
+        """Parse the Tensorboard events logs and add to :attr:`_cache`.
+
+        Parameters
+        ----------
+        session_id
+            The session id that the data is being cached for
+        """
+        assert self._iterator is not None
+
+        data: dict[int, EventData] = {}
+        tags: list[str] = []
+        for record in self._iterator:
+            event = event_pb2.Event.FromString(  # pyright:ignore[reportAttributeAccessIssue]
+                record
+                )
+            if not event.summary.value:
+                continue
+            # filter out loss specific values, just keep totals
+            if not event.summary.value[0].tag.startswith(("batch_face_",
+                                                          "batch_mask_",
+                                                          "batch_total")):
+                continue
+            tag = event.summary.value[0].tag
+            if tag not in tags and tag != "batch_total":
+                tags.append(tag)
+            data[event.step] = self._process_event(event,
+                                                   data.get(event.step, EventData()))
+
+        tags = self._format_tags(tags)
+        self._cache.cache_data(session_id, data, tags, is_live=self._live_data)
+
+
+__all__ = get_module_objects(__name__)

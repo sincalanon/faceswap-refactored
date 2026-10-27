@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+"""Aligned faces for faceswap.py"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import logging
+import typing as T
+
+from threading import Lock
+
+import cv2
+import numpy as np
+
+from lib.logger import parse_class_init
+from lib.utils import get_module_objects
+
+from .constants import CenteringType, EXTRACT_RATIOS, LandmarkType, MEAN_FACE
+from .aligned_utils import (get_base_size, get_sub_crop_size, get_matrix_scaling, points_to_68,
+                            sub_crop, transform_image)
+from .aligned_mask import LandmarksMask
+from .pose import PoseEstimate
+
+if T.TYPE_CHECKING:
+    import numpy.typing as npt
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _FaceCache:  # pylint:disable=too-many-instance-attributes
+    """Cache for storing items related to a single aligned face.
+
+    Items are cached so that they are only created the first time they are called.
+    Each item includes a threading lock to make cache creation thread safe.
+
+    Parameters
+    ----------
+    pose
+        The estimated pose in 3D space. Default: ``None``
+    original_roi
+        The location of the extracted face box within the original frame. Default: ``None``
+    landmarks
+        The 68 point facial landmarks aligned to the extracted face box. Default: ``None``
+    landmarks_normalized
+        The 68 point facial landmarks normalized to 0.0 - 1.0 as aligned by Umeyama.
+        Default: ``None``
+    average_distance
+        The average distance of the core landmarks (18-67) from the mean face that was used for
+        aligning the image.  Default: `0.0`
+    relative_eye_mouth_position
+        A float value representing the relative position of the lowest eye/eye-brow point to the
+        highest mouth point. Positive values indicate that eyes/eyebrows are aligned above the
+        mouth, negative values indicate that eyes/eyebrows are misaligned below the mouth.
+        Default: `0.0`
+    adjusted_matrix
+        The 3x2 transformation matrix for extracting and aligning the core face area out of the
+        original frame with padding and sizing applied. Default: ``None``
+    interpolators
+        (`interpolator` and `reverse interpolator`) for the :attr:`adjusted matrix`.
+        Default: `(0, 0)`
+    cropped_roi
+        The (`left`, `top`, `right`, `bottom` location of the region of interest within an
+            aligned face centered for each centering. Default: `{}`
+    cropped_slices
+        The slices for an input full head image and output cropped image. Default: `{}`
+    """
+    pose: PoseEstimate | None = None
+    original_roi: np.ndarray | None = None
+    landmarks: np.ndarray | None = None
+    landmarks_normalized: np.ndarray | None = None
+    average_distance: float = 0.0
+    relative_eye_mouth_position: float = 0.0
+    adjusted_matrix: np.ndarray | None = None
+    interpolators: tuple[int, int] = (0, 0)
+    cropped_roi: dict[CenteringType, np.ndarray] = field(default_factory=dict)
+    cropped_slices: dict[CenteringType, dict[T.Literal["in", "out"],
+                                             tuple[slice, slice]]] = field(default_factory=dict)
+
+    _locks: dict[str, Lock] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Initialize the locks for the class parameters"""
+        self._locks = {name: Lock() for name in self.__dict__}
+
+    def lock(self, name: str) -> Lock:
+        """Obtain the lock for the given property
+
+        Parameters
+        ----------
+        name
+            The name of a parameter within the cache
+
+        Returns
+        -------
+        The lock associated with the requested parameter
+        """
+        return self._locks[name]
+
+
+class AlignedFace:  # pylint:disable=too-many-instance-attributes
+    """Class to align a face.
+
+    Holds the aligned landmarks and face image, as well as associated matrices and information
+    about an aligned face.
+
+    Parameters
+    ----------
+    landmarks
+        The original 68 point landmarks that pertain to the given image for this face
+    image
+        The original frame that contains the face that is to be aligned. Pass `None` if the aligned
+        face is not to be generated, and just the co-ordinates should be calculated.
+    centering
+        The type of extracted face that should be loaded. "legacy" places the nose in the center of
+        the image (the original method for aligning). "face" aligns for the nose to be in the
+        center of the face (top to bottom) but the center of the skull for left to right. "head"
+        aligns for the center of the skull (in 3D space) being the center of the extracted image,
+        with the crop holding the full head. Default: `"face"`
+    size
+        The size in pixels, of each edge of the final aligned face. Default: `64`
+    coverage_ratio
+        The amount of the aligned image to return. A ratio of 1.0 will return the full contents of
+        the aligned image. A ratio of 0.5 will return an image of the given size, but will crop to
+        the central 50%% of the image.
+    y_offset
+        Amount to adjust the aligned face along the y-axis in the range -1. to 1. Default: 0.0
+    dtype
+        Set a data type for the final face to be returned as. Passing ``None`` will return a face
+        with the same data type as the original :attr:`image`. Default: ``None``
+    is_aligned_face
+        Indicates that the :attr:`image` is an aligned face rather than a frame.
+        Default: ``False``
+    is_legacy
+        Only used if `is_aligned` is ``True``. ``True`` indicates that the aligned image being
+        loaded is a legacy extracted face rather than a current head extracted face
+    """
+    def __init__(self,
+                 landmarks: np.ndarray,
+                 image: np.ndarray | None = None,
+                 centering: CenteringType = "face",
+                 size: int = 64,
+                 coverage_ratio: float = 1.0,
+                 y_offset: float = 0.0,
+                 dtype: str | None = None,
+                 is_aligned: bool = False,
+                 is_legacy: bool = False) -> None:
+        logger.trace(parse_class_init(locals()))  # type:ignore[attr-defined]
+        self._frame_landmarks = landmarks
+        self._landmark_type = LandmarkType.from_shape(landmarks.shape)
+        self._centering: CenteringType = centering
+        self._size = size
+        self._coverage_ratio = coverage_ratio
+        self._y_offset = y_offset
+        self._dtype = dtype
+        self._is_aligned = is_aligned
+        self._source_centering: CenteringType = "legacy" if is_legacy and is_aligned else "head"
+        self._padding = self._padding_from_coverage(size, coverage_ratio)
+
+        lookup = self._landmark_type
+        self._mean_lookup = LandmarkType.LM_2D_51 if lookup in (LandmarkType.LM_2D_68,
+                                                                LandmarkType.LM_2D_98) else lookup
+
+        self._cache = _FaceCache()
+        self._matrices: dict[CenteringType, np.ndarray] = {"legacy": self._get_default_matrix()}
+
+        self._face = self.extract_face(image)
+        logger.trace("Initialized: %s (padding: %s, face shape: %s)",  # type:ignore[attr-defined]
+                     self.__class__.__name__, self._padding,
+                     self._face if self._face is None else self._face.shape)
+
+    @property
+    def centering(self) -> T.Literal["legacy", "head", "face"]:
+        """The centering of the Aligned Face. One of `"legacy"`, `"head"`, `"face"`."""
+        return self._centering
+
+    @property
+    def size(self) -> int:
+        """The size (in pixels) of one side of the square extracted face image."""
+        return self._size
+
+    @property
+    def padding(self) -> int:
+        """The amount of padding (in pixels) that is applied to each side of the extracted face
+        image for the selected extract type."""
+        return self._padding[self._centering]
+
+    @property
+    def y_offset(self) -> float:
+        """Additional offset applied to the face along the y-axis in -1. to 1. range"""
+        return self._y_offset
+
+    @property
+    def matrix(self) -> np.ndarray:
+        """The 3x2 transformation matrix for extracting and aligning the core face area out of the
+        original frame, with no padding or sizing applied. The returned matrix is offset for the
+        given :attr:`centering`."""
+        if self._centering not in self._matrices:
+            matrix = self._matrices["legacy"].copy()
+            matrix[:, 2] -= self.pose.offset[self._centering]
+            self._matrices[self._centering] = matrix
+            logger.trace("original matrix: %s, new matrix: %s",  # type:ignore[attr-defined]
+                         self._matrices["legacy"], matrix)
+        return self._matrices[self._centering]
+
+    @property
+    def pose(self) -> PoseEstimate:
+        """The estimated pose in 3D space."""
+        with self._cache.lock("pose"):
+            if self._cache.pose is None:
+                lms = np.nan_to_num(cv2.transform(np.expand_dims(self._frame_landmarks, axis=1),
+                                    self._matrices["legacy"]).squeeze())
+                self._cache.pose = PoseEstimate(lms, self._landmark_type)
+        return self._cache.pose
+
+    @property
+    def adjusted_matrix(self) -> np.ndarray:
+        """The 3x2 transformation matrix for extracting and aligning the core face area out of the
+        original frame with padding and sizing applied."""
+        with self._cache.lock("adjusted_matrix"):
+            if self._cache.adjusted_matrix is None:
+                mat = self.matrix * (self._size - 2 * self.padding)
+                mat[:, 2] += self.padding
+                logger.trace("adjusted_matrix: %s", mat)  # type:ignore[attr-defined]
+                self._cache.adjusted_matrix = mat
+        return self._cache.adjusted_matrix
+
+    @property
+    def face(self) -> np.ndarray | None:
+        """The aligned face at the given :attr:`size` at the specified :attr:`coverage` in the
+        given :attr:`dtype`. If an :attr:`image` has not been provided then an the attribute will
+        return ``None``. """
+        return self._face
+
+    @property
+    def original_roi(self) -> np.ndarray:
+        """The location of the extracted face box within the original frame."""
+        with self._cache.lock("original_roi"):
+            if self._cache.original_roi is None:
+                roi = np.array([[0, 0],
+                                [0, self._size - 1],
+                                [self._size - 1, self._size - 1],
+                                [self._size - 1, 0]])
+                roi = np.rint(self.transform_points(roi, invert=True)).astype("int32")
+                logger.trace("original roi: %s", roi)  # type:ignore[attr-defined]
+                self._cache.original_roi = roi
+        return self._cache.original_roi
+
+    @property
+    def landmarks(self) -> np.ndarray:
+        """The 68 point facial landmarks aligned to the extracted face box."""
+        with self._cache.lock("landmarks"):
+            if self._cache.landmarks is None:
+                lms = self.transform_points(self._frame_landmarks)
+                logger.trace("aligned landmarks: %s", lms)  # type:ignore[attr-defined]
+                self._cache.landmarks = lms
+            return self._cache.landmarks
+
+    @property
+    def landmark_type(self) -> LandmarkType:
+        """The type of landmarks that generated this aligned face"""
+        return self._landmark_type
+
+    @property
+    def normalized_landmarks(self) -> np.ndarray:
+        """The 68 point facial landmarks normalized to 0.0 - 1.0 as aligned by Umeyama."""
+        with self._cache.lock("landmarks_normalized"):
+            if self._cache.landmarks_normalized is None:
+                lms = np.expand_dims(self._frame_landmarks, axis=1)
+                lms = cv2.transform(lms, self._matrices["legacy"]).squeeze()
+                logger.trace("normalized landmarks: %s", lms)  # type:ignore[attr-defined]
+                self._cache.landmarks_normalized = lms
+        return self._cache.landmarks_normalized
+
+    @property
+    def interpolators(self) -> tuple[int, int]:
+        """(`interpolator` and `reverse interpolator`) for the :attr:`adjusted matrix`."""
+        with self._cache.lock("interpolators"):
+            if not any(self._cache.interpolators):
+                interpolators = get_matrix_scaling(self.adjusted_matrix)
+                logger.trace("interpolators: %s", interpolators)  # type:ignore[attr-defined]
+                self._cache.interpolators = interpolators
+        return self._cache.interpolators
+
+    @property
+    def average_distance(self) -> float:
+        """The average distance of the core landmarks (18-67) from the mean face that was used for
+        aligning the image."""
+        with self._cache.lock("average_distance"):
+            if not self._cache.average_distance:
+                if self._landmark_type not in (LandmarkType.LM_2D_68, LandmarkType.LM_2D_98):
+                    return 0.0
+                mean_face = MEAN_FACE[self._mean_lookup]
+                lms = self.normalized_landmarks
+                if self._landmark_type != LandmarkType.LM_2D_68:
+                    lms = points_to_68(lms)
+                lms = lms[17:]  # 68 point landmarks only use core face items
+                average_distance = np.mean(np.abs(lms - mean_face))
+                logger.trace("average_distance: %s", average_distance)  # type:ignore[attr-defined]
+                self._cache.average_distance = float(average_distance)
+        return self._cache.average_distance
+
+    @property
+    def relative_eye_mouth_position(self) -> float:
+        """Value representing the relative position of the lowest eye/eye-brow point to the highest
+        mouth point. Positive values indicate that eyes/eyebrows are aligned above the mouth,
+        negative values indicate that eyes/eyebrows are misaligned below the mouth."""
+        with self._cache.lock("relative_eye_mouth_position"):
+            if not self._cache.relative_eye_mouth_position:
+                if self._landmark_type not in (LandmarkType.LM_2D_68, LandmarkType.LM_2D_98):
+                    position = 1.0  # arbitrary positive value
+                else:
+                    lms = self.normalized_landmarks
+                    if self._landmark_type != LandmarkType.LM_2D_68:
+                        lms = points_to_68(lms)
+                    lowest_eyes = np.max(self.normalized_landmarks[np.r_[17:27, 36:48], 1])
+                    highest_mouth = np.min(self.normalized_landmarks[48:68, 1])
+                    position = highest_mouth - lowest_eyes
+                    logger.trace(  # type:ignore[attr-defined]
+                        "lowest_eyes: %s, highest_mouth: %s, relative_eye_mouth_position: %s",
+                        lowest_eyes, highest_mouth, position)
+                self._cache.relative_eye_mouth_position = position
+        return self._cache.relative_eye_mouth_position
+
+    @classmethod
+    def _padding_from_coverage(cls, size: int, coverage_ratio: float) -> dict[CenteringType, int]:
+        """Return the image padding for a face from coverage_ratio set against a pre-padded
+        training image.
+
+        Parameters
+        ----------
+        size
+            The final size of the aligned image in pixels
+        coverage_ratio
+            The ratio of the final image to pad to
+
+        Returns
+        -------
+        The padding required, in pixels for 'head', 'face' and 'legacy' face types
+        """
+        retval = {_type: round(size * (EXTRACT_RATIOS[_type] + coverage_ratio - 1) /
+                               (2 * coverage_ratio))
+                  for _type in T.get_args(T.Literal["legacy", "face", "head"])}
+        logger.trace(retval)  # type:ignore[attr-defined]
+        return retval
+
+    def _get_default_matrix(self) -> np.ndarray:
+        """Get the default (legacy) matrix. All subsequent matrices are calculated from this
+
+        Returns
+        -------
+        The default 'legacy' matrix
+        """
+        lms = self._frame_landmarks
+        if self._landmark_type not in (LandmarkType.LM_2D_68, LandmarkType.LM_2D_4):
+            lms = points_to_68(lms)
+        if self._landmark_type in (LandmarkType.LM_2D_68, LandmarkType.LM_2D_98):
+            lms = lms[17:]  # 68 point landmarks only use core face items
+        retval = _umeyama(lms, MEAN_FACE[self._mean_lookup], True)[0:2]
+        logger.trace("Default matrix: %s", retval)  # type:ignore[attr-defined]
+        return retval
+
+    def transform_points(self, points: np.ndarray, invert: bool = False) -> np.ndarray:
+        """Perform transformation on a series of (x, y) co-ordinates in world space into
+        aligned face space.
+
+        Parameters
+        ----------
+        points
+            The points to transform
+        invert
+            ``True`` to reverse the transformation (i.e. transform the points into world space from
+            aligned face space). Default: ``False``
+
+        Returns
+        -------
+        The transformed points
+        """
+        retval = np.expand_dims(points, axis=1)
+        mat = self.adjusted_matrix
+        if self.y_offset:
+            mat = mat.copy()
+            mat[1, 2] += (self.y_offset * (self._size - self.padding * 2))
+        mat = cv2.invertAffineTransform(mat) if invert else mat
+        retval = cv2.transform(retval, mat).squeeze()
+        logger.trace(  # type:ignore[attr-defined]
+            "invert: %s, Original points: %s, transformed points: %s", invert, points, retval)
+        return retval
+
+    def extract_face(self, image: np.ndarray | None) -> np.ndarray | None:
+        """Extract the face from a source image and populate :attr:`face`. If an image is not
+        provided then ``None`` is returned.
+
+        Parameters
+        ----------
+        image
+            The original frame to extract the face from. ``None`` if the face should not be
+            extracted
+
+        Returns
+        -------
+        The extracted face at the given size, with the given coverage of the given dtype or
+        ``None`` if no image has been provided.
+        """
+        if image is None:
+            logger.trace("_extract_face called without a loaded "  # type:ignore[attr-defined]
+                         "image. Returning empty face.")
+            return None
+
+        if self._is_aligned:
+            # Crop out the sub face from full head
+            image = self._convert_centering(image)
+
+        if self._is_aligned and image.shape[0] != self._size:  # Resize the given aligned face
+            interpolation = cv2.INTER_CUBIC if image.shape[0] < self._size else cv2.INTER_AREA
+            retval = cv2.resize(image, (self._size, self._size), interpolation=interpolation)
+        elif self._is_aligned:
+            retval = image
+        else:
+            mat = self.matrix
+            if self.y_offset:
+                mat = self.matrix.copy()
+                mat[1, 2] += self.y_offset
+            retval = transform_image(image, mat, self._size, self.padding)
+        retval = retval if self._dtype is None else retval.astype(self._dtype)
+        return retval
+
+    def _convert_centering(self, image: np.ndarray) -> np.ndarray:
+        """When the face being loaded is pre-aligned, the loaded image will have 'head' centering
+        so it needs to be cropped out to the appropriate centering.
+
+        Parameters
+        ----------
+        image
+            The original head-centered aligned image
+
+        Returns
+        -------
+        The aligned image with the correct centering, scaled to image input size
+        """
+        logger.trace(  # type:ignore[attr-defined]
+            "image_size: %s, target_size: %s, coverage_ratio: %s",
+            image.shape[0], self.size, self._coverage_ratio)
+
+        img_size = image.shape[0]
+        target_size = get_sub_crop_size(self._source_centering,
+                                        self._centering,
+                                        img_size,
+                                        self._coverage_ratio)
+        base_size = get_base_size(img_size, self._source_centering, 1.0)
+        padding_diff = (img_size - target_size) / 2
+        delta = self.pose.offset[self._centering] - self.pose.offset[self._source_centering]
+        if self.y_offset:
+            delta[1] -= self.y_offset
+        offset = np.rint(delta * base_size + padding_diff).astype("int32")
+        retval = sub_crop(image, offset, target_size)
+        logger.trace(  # type:ignore[attr-defined]
+            "Cropped from aligned extract: (centering: %s, in shape: %s, out shape: %s)",
+            self._centering, image.shape, retval.shape)
+        return retval
+
+    def split_mask(self) -> np.ndarray:
+        """Remove the mask from the alpha channel of :attr:`face` and return the mask
+
+        Returns
+        -------
+        The mask that was stored in the :attr:`face`'s alpha channel
+
+        Raises
+        ------
+        AssertionError
+            If :attr:`face` does not contain a mask in the alpha channel
+        """
+        assert self._face is not None
+        assert self._face.shape[-1] == 4, "No mask stored in the alpha channel"
+        mask = self._face[..., 3]
+        self._face = self._face[..., :3]
+        return mask
+
+    def get_landmark_mask(self,
+                          area: T.Literal["eye", "mouth", "face", "face_extended"],
+                          dilation: float = 0,
+                          blur_kernel: int = 0,
+                          blur_type: T.Literal["gaussian", "normalized"] | None = "gaussian",
+                          blur_passes: int = 1) -> npt.NDArray[np.uint8]:
+        """Obtain a :class:`~lib.align.aligned_mask.LandmarksMask` based mask for this face
+
+        Landmark based masks are generated from Aligned Face landmark points.
+
+        Parameters
+        ----------
+        area
+            The type of mask to obtain. `face` is a full face mask, `face_extended` is a face mask
+            that extends above the eyebrows. The others are masks for those specific areas
+        dilation
+            The amount of dilation to apply to the mask. as a percentage of the mask size.
+            Default: 0
+        blur_kernel
+            The kernel size, in pixels to apply gaussian blurring to the mask. Set to 0 for no
+            blurring. Should be odd, if an even number is passed in (outside of 0) then it is
+            rounded up to the next odd number. Default: 0
+        blur_type
+            The blur type to use. ``gaussian`` or ``normalized`` box filter. Default: ``gaussian``
+        blur_passes
+            The number of passed to perform when blurring. Default: 1
+
+        Returns
+        -------
+        The requested Landmarks Mask
+        """
+        logger.trace("area: %s, dilation: %s", area, dilation)  # type:ignore[attr-defined]
+        mask = LandmarksMask(area,
+                             self.landmark_type,
+                             self.landmarks,
+                             self.size,
+                             dilation=dilation,
+                             blur_kernel=blur_kernel,
+                             blur_type=blur_type,
+                             blur_passes=blur_passes)
+        return mask.mask
+
+
+def _umeyama(source: np.ndarray, destination: np.ndarray, estimate_scale: bool) -> np.ndarray:
+    """Estimate N-D similarity transformation with or without scaling.
+
+    Imported, and slightly adapted, directly from:
+    https://github.com/scikit-image/scikit-image/blob/master/skimage/transform/_geometric.py
+
+
+    Parameters
+    ----------
+    source
+        (M, N) array source coordinates.
+    destination
+        (M, N) array destination coordinates.
+    estimate_scale
+        Whether to estimate scaling factor.
+
+    Returns
+    -------
+    (N + 1, N + 1) The homogeneous similarity transformation matrix. The matrix contains NaN values
+    only if the problem is not well-conditioned.
+
+    References
+    ----------
+    .. [1] "Least-squares estimation of transformation parameters between two
+            point patterns", Shinji Umeyama, PAMI 1991, :DOI:`10.1109/34.88573`
+    """
+    # pylint:disable=invalid-name,too-many-locals
+    num = source.shape[0]
+    dim = source.shape[1]
+
+    # Compute mean of source and destination.
+    src_mean = source.mean(axis=0)
+    dst_mean = destination.mean(axis=0)
+
+    # Subtract mean from source and destination.
+    src_demean = source - src_mean
+    dst_demean = destination - dst_mean
+
+    # Eq. (38).
+    A = dst_demean.T @ src_demean / num
+
+    # Eq. (39).
+    d = np.ones((dim,), dtype=np.double)
+    if np.linalg.det(A) < 0:
+        d[dim - 1] = -1
+
+    retval = np.eye(dim + 1, dtype=np.double)
+
+    U, S, V = np.linalg.svd(A)
+
+    # Eq. (40) and (43).
+    rank = np.linalg.matrix_rank(A)
+    if rank == 0:
+        return np.nan * retval
+    if rank == dim - 1:
+        if np.linalg.det(U) * np.linalg.det(V) > 0:
+            retval[:dim, :dim] = U @ V
+        else:
+            s = d[dim - 1]
+            d[dim - 1] = -1
+            retval[:dim, :dim] = U @ np.diag(d) @ V
+            d[dim - 1] = s
+    else:
+        retval[:dim, :dim] = U @ np.diag(d) @ V
+
+    if estimate_scale:
+        # Eq. (41) and (42).
+        scale = 1.0 / src_demean.var(axis=0).sum() * (S @ d)
+    else:
+        scale = 1.0
+
+    retval[:dim, dim] = dst_mean - scale * (retval[:dim, :dim] @ src_mean.T)
+    retval[:dim, :dim] *= scale
+
+    return retval
+
+
+def batch_umeyama(source: np.ndarray, destination: np.ndarray, estimate_scale: bool) -> np.ndarray:
+    """A batch implementation to estimate N-D similarity transformation with or without scaling.
+
+    Parameters
+    ----------
+    source
+        (B, M, N) array source coordinates.
+    destination
+        (M, N) array destination coordinates.
+    estimate_scale: bool
+        Whether to estimate scaling factor.
+
+    Returns
+    -------
+    (B, N + 1, N + 1) The homogeneous similarity transformation matrix. The matrix contains NaN
+    values only if the problem is not well-conditioned.
+
+    References
+    ----------
+    .. [1] "Least-squares estimation of transformation parameters between two
+            point patterns", Shinji Umeyama, PAMI 1991, :DOI:`10.1109/34.88573`
+    """
+    # pylint:disable=too-many-locals
+    batch_size, num, dim = source.shape  # (B, M, N)
+
+    # Compute mean of source and destination.
+    src_mean = source.mean(axis=1)       # (B, N)
+    dst_mean = destination.mean(axis=0)  # (N, )
+
+    # Subtract mean from source and destination.
+    src_demean = source - src_mean[:, None]  # (B, M, N)
+    dst_demean = destination - dst_mean      # (M, N)
+
+    # Eq. (38).
+    a = dst_demean.T @ src_demean / num  # (B, N, N)
+
+    # SVD
+    u, s, vt = np.linalg.svd(a)
+
+    rot = u @ vt
+    det_rot = np.linalg.det(rot)
+    # Fix improper rotations
+    vt[det_rot < 0, -1, :] *= -1
+    rot = u @ vt
+
+    if estimate_scale:
+        # Eq. (41) and (42).
+        var_src = src_demean.var(axis=1).sum(axis=1)  # (B,)
+        scale = s.sum(axis=1) / var_src
+    else:
+        scale = np.ones(batch_size)
+
+    trans = dst_mean - scale[:, None] * ((rot @ src_mean[..., None])[..., 0])
+    retval = np.zeros((batch_size, dim + 1, dim + 1), dtype=source.dtype)
+    retval[:, -1, -1] = 1.0
+
+    retval[:, :dim, :dim] = scale[:, None, None] * rot
+    retval[:, :dim, dim] = trans
+    return retval
+
+
+__all__ = get_module_objects(__name__)
