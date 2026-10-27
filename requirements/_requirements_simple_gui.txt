@@ -1,0 +1,4 @@
+# Optional: only needed for the simplified web UI (python app.py). See SIMPLE_GUI_zh-CN.md
+# Install on top of your normal Faceswap requirements:
+#   pip install -r requirements/_requirements_simple_gui.txt
+gradio>=5.0

@@ -27,6 +27,8 @@ python faceswap.py gui
 
 界面里有 Extract / Train / Convert 三个标签页，鼠标悬停在选项上会显示说明。
 
+**更简单的中文网页版（推荐新手）：** `pip install gradio` 后运行 `python app.py`，在浏览器中按「提取 → 训练 → 转换」三步操作，只显示常用参数。详见 [SIMPLE_GUI_zh-CN.md](SIMPLE_GUI_zh-CN.md)。
+
 ## 3. 命令行三步
 
 ### 第一步：提取人脸

@@ -562,6 +562,7 @@ class Effmpeg:
         for char in chk_string:
             if not char.isdigit():
                 break
+            pos += 1
         logger.debug("filename: '%s', pos: %s", filename, pos)
         return pos
 

@@ -17,6 +17,7 @@
 !/setup.py
 !/tools.py
 !/update_deps.py
+!/app.py
 
 # Support files
 !/.github/
@@ -58,6 +59,8 @@
 !tools/
 !tools/**/
 !tools/**/*.py
+!simple_gui/
+!simple_gui/*.py
 
 # GUI Plugin Presets
 !lib/gui/**/presets/train/model_phaze_a_dfaker_preset.json
