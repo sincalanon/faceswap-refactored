@@ -18,8 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         # TODO revert. Despite documentation to the contrary, MacOS runners are always x86-64
-        #os: ["ubuntu-latest", "windows-latest", "macos-latest"]
-        os: ["ubuntu-latest", "windows-latest"]
+        #os: ["ubuntu-24.04", "windows-latest", "macos-latest"]
+        os: ["ubuntu-24.04", "windows-latest"]
         python-version: ["3.11", "3.12", "3.13"]
         backend: ["nvidia", "cpu", "rocm", "apple-silicon"]
         exclude:
@@ -29,7 +29,7 @@ jobs:
           - os: windows-latest
             backend: apple-silicon
           # No apple-silicon on Linux
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             backend: apple-silicon
           # Only Apple-Silicon on MacOS
           - os: "macos-latest"
@@ -39,7 +39,7 @@ jobs:
           - os: "macos-latest"
             backend: "nvidia"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Cleanup space
         # We run out of space on rocm. Ref: https://github.com/actions/runner-images/issues/709
         if: matrix.backend == 'rocm'
@@ -49,7 +49,7 @@ jobs:
         run: echo "DATE=$(date +'%Y%m%d')" >> $GITHUB_ENV
       # TODO Re-enable. Currently disabled as it does not seem to get used and takes a lot of space
       #- name: Cache conda
-      #  uses: actions/cache@v3
+      #  uses: actions/cache@v5
       #  env:
       #    # Increase this value to manually reset cache
       #    CACHE_NUMBER: 1
@@ -58,7 +58,7 @@ jobs:
       #    path: ~/conda_pkgs_dir
       #    key: ${{ runner.os }}-${{ matrix.backend }}-conda-${{ matrix.python-version }}-${{ env.CACHE_NUMBER }}-${{ env.DATE }}-${{ hashFiles('./requirements/requirements.txt', env.REQ_FILE) }}
       - name: Set up Conda
-        uses: conda-incubator/setup-miniconda@v2
+        uses: conda-incubator/setup-miniconda@v4
         with:
           python-version: ${{ matrix.python-version }}
           miniconda-version: "latest"
@@ -93,8 +93,8 @@ jobs:
           KERAS_BACKEND=torch KERAS_TORCH_DEVICE=cpu FACESWAP_BACKEND="${{ matrix.backend }}" python tests/simple_tests.py;
 
   build_linux:
-    name: "pip (ubuntu-latest, ${{ matrix.backend }} ${{ matrix.python-version }})"
-    runs-on: ubuntu-latest
+    name: "pip (ubuntu-24.04, ${{ matrix.backend }} ${{ matrix.python-version }})"
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -103,9 +103,9 @@ jobs:
         include:
           - backend: "cpu"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
@@ -148,9 +148,9 @@ jobs:
         include:
           - backend: "cpu"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
