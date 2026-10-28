@@ -61,7 +61,7 @@ jobs:
           New-Item -ItemType Directory -Force "$env:DIST\faceswap\config" | Out-Null
           '{"backend": "nvidia"}' | Out-File -Encoding ascii "$env:DIST\faceswap\config\.faceswap"
           # Tutorial as UTF-8 with BOM so Notepad and the installer show the Chinese text correctly
-          Get-Content -Raw -Encoding utf8 WINDOWS_TUTORIAL_zh-CN.md | Set-Content -NoNewline -Encoding utf8BOM "$env:DIST\使用教程.txt"
+          Get-Content -Raw -Encoding utf8 .install/windows_portable/tutorial_zh-CN.txt | Set-Content -NoNewline -Encoding utf8BOM "$env:DIST\使用教程.txt"
 
       - name: Pre-download model weights (users behind slow/blocked GitHub need no download)
         env:
@@ -188,7 +188,7 @@ jobs:
           便携版：下载全部 .7z.00x 分卷，用 7-Zip 解压 .7z.001，双击 FaceswapSimple.exe。
 
           需要 RTX 20 系列或更新显卡、驱动 580+；Python、CUDA 和常用模型权重均已内置，无需联网。
-          详细教程：https://github.com/sincalanon/faceswap-refactored/blob/main/WINDOWS_TUTORIAL_zh-CN.md
+          详细教程：https://github.com/sincalanon/faceswap-refactored/blob/main/README_zh-CN.md
 
           仅可用于已获得当事人同意的素材。GPL-3.0。
           "@

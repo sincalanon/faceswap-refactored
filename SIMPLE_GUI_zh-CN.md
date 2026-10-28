@@ -19,7 +19,7 @@ Gradio 是可选依赖，不安装也不影响原有的命令行和 Tk 图形界
 
 Windows 用户无需安装 Python：到仓库 Releases 下载 `FaceswapSimple-Setup.exe` 和全部 `FaceswapSimple-Setup-*.bin`，放在同一文件夹，双击 Setup.exe 安装后从桌面启动即可；也提供 7z 便携版。Python、PyTorch（CUDA 13）和常用模型权重都已内置，无需联网下载。需要 RTX 20 系列或更新显卡、驱动 580+。
 
-完整图文步骤见 **[WINDOWS_TUTORIAL_zh-CN.md](WINDOWS_TUTORIAL_zh-CN.md)**。
+完整图文步骤见 **[README_zh-CN.md](README_zh-CN.md)**。
 
 维护者发布新版：推送 `v*` 标签（如 `git tag v1.1.1 && git push origin v1.1.1`），或在 Actions 里手动运行 `build/windows-nvidia`，安装包和便携包会自动上传到对应 Release。
 
