@@ -81,10 +81,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py -c "from simple_gui import ui; ui.build_app(); print('simple_gui OK')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The build runner has no NVIDIA driver (no nvml.dll), so check the CLI with the CPU backend
+          $env:FACESWAP_BACKEND = "cpu"
           & $py faceswap.py extract -h | Select-Object -First 5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py tools.py effmpeg -h | Select-Object -First 3
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py app.py --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:FACESWAP_BACKEND = "nvidia"
           Pop-Location
           # The launcher must start the UI: run it headless and probe the port
           $p = Start-Process -FilePath "$env:DIST\FaceswapSimple.exe" -ArgumentList "--no-browser","--port","7861" -PassThru
