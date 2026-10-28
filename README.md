@@ -1,5 +1,8 @@
 # deepfakes_faceswap
 
+> **中文用户 / Chinese users:** Windows 小白一步步教程（安装包、工作文件夹、提取 → 训练 → 转换、常见问题）见 [README_zh-CN.md](README_zh-CN.md#windows-小白操作步骤不用敲命令)。
+
+
 ### Important information for **Patreon** and **PayPal** supporters. Please see this forum post: https://forum.faceswap.dev/viewtopic.php?f=14&t=3120
 
 <p align="center">
