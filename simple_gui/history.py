@@ -83,6 +83,16 @@ class RecentPaths:
         self._save()
 
     @property
+    def workdir(self) -> str:
+        """ str : The fixed work folder (工作文件夹), or ``""`` """
+        return str(self._data.get("workdir", ""))
+
+    @workdir.setter
+    def workdir(self, path: str) -> None:
+        self._data["workdir"] = clean_path(path)
+        self._save()
+
+    @property
     def preset(self) -> str:
         """ str : The last preset the user picked, or ``""`` """
         return str(self._data.get("preset", ""))

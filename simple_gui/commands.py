@@ -14,7 +14,7 @@ import typing as T
 from dataclasses import dataclass
 
 from .paths import (FACESWAP_SCRIPT, IMAGE_EXTENSIONS, TOOLS_SCRIPT, clean_path, count_images,
-                    has_model, is_video)
+                    has_model, is_video, media_path)
 from .presets import AUTO
 
 MIN_TRAIN_IMAGES = 25
@@ -110,11 +110,16 @@ def _flag(flag: str, enabled: bool) -> list[str]:
     return [flag] if enabled else []
 
 
+def _extract_input(opts: ExtractOptions) -> str:
+    """ The input path, with a single-video folder resolved to its video (not in batch mode) """
+    return clean_path(opts.input_path) if opts.batch_mode else media_path(opts.input_path)
+
+
 def _every_n(opts: ExtractOptions) -> list[str]:
     """ ``-N`` only makes sense for video frames. For a folder of photos every image is a
     different shot, so skipping 4 of 5 would silently throw most of the material away. Batch
     mode can contain videos, so it keeps the option. """
-    if not opts.batch_mode and not is_video(clean_path(opts.input_path)):
+    if not opts.batch_mode and not is_video(media_path(opts.input_path)):
         return []
     return _number("-N", opts.extract_every_n, 1)
 
@@ -122,7 +127,7 @@ def _every_n(opts: ExtractOptions) -> list[str]:
 def build_extract(opts: ExtractOptions) -> list[str]:
     """ Build the ``faceswap.py extract`` command line """
     return (_base(FACESWAP_SCRIPT, "extract")
-            + ["-i", clean_path(opts.input_path), "-o", clean_path(opts.output_dir)]
+            + ["-i", _extract_input(opts), "-o", clean_path(opts.output_dir)]
             + _choice("-D", opts.detector)
             + _choice("-A", opts.aligner)
             + _choice("-M", opts.masker, skip=(AUTO, "none"))
@@ -152,13 +157,13 @@ def resolve_writer(writer: str, input_path: str) -> str:
     images otherwise (opencv). """
     if writer and writer != AUTO:
         return writer
-    return "ffmpeg" if is_video(clean_path(input_path)) else "opencv"
+    return "ffmpeg" if is_video(media_path(input_path)) else "opencv"
 
 
 def build_convert(opts: ConvertOptions) -> list[str]:
     """ Build the ``faceswap.py convert`` command line """
     return (_base(FACESWAP_SCRIPT, "convert")
-            + ["-i", clean_path(opts.input_path), "-o", clean_path(opts.output_dir),
+            + ["-i", media_path(opts.input_path), "-o", clean_path(opts.output_dir),
                "-m", clean_path(opts.model_dir)]
             + _choice("-p", clean_path(opts.alignments))
             + ["-w", resolve_writer(opts.writer, opts.input_path)]
@@ -171,7 +176,7 @@ def build_convert(opts: ConvertOptions) -> list[str]:
 def build_video(opts: VideoOptions) -> list[str]:
     """ Build the ``tools.py effmpeg`` command line """
     args = (_base(TOOLS_SCRIPT, "effmpeg")
-            + ["-a", opts.action, "-i", clean_path(opts.input_path),
+            + ["-a", opts.action, "-i", media_path(opts.input_path),
                "-o", clean_path(opts.output_path)])
     if opts.action != "gen-vid":
         return args
@@ -226,11 +231,13 @@ def _check_extract_input(path: str, batch_mode: bool) -> list[str]:
     if batch_mode or not os.path.isdir(path) or count_images(path) > 0:
         return []
     names = os.listdir(path)
-    videos = [name for name in names if is_video(name)]
+    videos = sorted(name for name in names if is_video(name))
+    if len(videos) == 1:
+        return []
     if videos:
         example = os.path.join(path, videos[0])
-        return [f"「输入」文件夹里没有图片，只有视频（如 {videos[0]}）。处理视频时请直接填写视频文件"
-                f"本身的路径，例如：{example}"]
+        return [f"「输入」文件夹里有 {len(videos)} 个视频，不知道该处理哪一个。请直接填写视频文件"
+                f"本身的路径，例如：{example}（或每个文件夹只放一个视频）"]
     if any(os.path.isdir(os.path.join(path, name)) for name in names):
         return ["「输入」文件夹里没有直接放图片，图片可能在子文件夹里。请填写图片所在的那一层文件夹，"
                 "或在「高级设置」里勾选「批量模式」。"]
@@ -280,7 +287,7 @@ def validate_video(opts: VideoOptions) -> list[str]:
     """ Pre-flight checks for the video shortcuts """
     errors = (_require(opts.input_path, "输入")
               + _require_value(opts.output_path, "输出"))
-    if opts.action == "extract" and not errors and not is_video(clean_path(opts.input_path)):
+    if opts.action == "extract" and not errors and not is_video(media_path(opts.input_path)):
         errors.append("「输入」需要是一个视频文件（如 .mp4）。")
     if opts.action == "gen-vid" and clean_path(opts.reference_video):
         errors += _require(opts.reference_video, "参考视频")

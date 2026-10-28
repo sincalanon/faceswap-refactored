@@ -154,3 +154,17 @@ def test_user_config_dir_override(monkeypatch, tmp_path):
     assert user_config_dir() == str(tmp_path)
     monkeypatch.delenv(CONFIG_ENV)
     assert user_config_dir().endswith("faceswap-simple-gui")
+
+
+def test_workspace_layout_and_create(tmp_path):
+    """ The work folder layout is created and remembered """
+    from simple_gui import history, workspace
+    assert workspace.layout("") == {} and workspace.create("")
+    work = tmp_path / "fs"
+    assert not workspace.create(f' "{work}" ')
+    paths = workspace.layout(str(work))
+    assert paths["faces_b"] == str(work / "facesB") and paths["result"].endswith("result.mp4")
+    assert (work / "A").is_dir() and (work / "model").is_dir()
+    store = history.RecentPaths(str(tmp_path / "cfg"))
+    store.workdir = f'"{work}"'
+    assert history.RecentPaths(str(tmp_path / "cfg")).workdir == str(work)

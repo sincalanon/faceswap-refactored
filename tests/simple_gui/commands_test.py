@@ -125,7 +125,9 @@ def test_validate_extract_folder_without_images(tmp_path):
     vids = tmp_path / "vids"
     vids.mkdir()
     (vids / "clip.MP4").write_bytes(b"x")
-    assert "视频文件" in check(vids)[0] and "clip.MP4" in check(vids)[0]
+    assert not check(vids)
+    (vids / "other.mp4").write_bytes(b"x")
+    assert "2 个视频" in check(vids)[0] and "clip.MP4" in check(vids)[0]
     nested = tmp_path / "nested"
     (nested / "sub").mkdir(parents=True)
     assert "子文件夹" in check(nested)[0]
@@ -194,3 +196,13 @@ def test_is_video():
     """ Extension check is case insensitive """
     assert is_video("a/b.MKV")
     assert not is_video("a/b.png")
+
+
+def test_single_video_folder_is_resolved(tmp_path):
+    """ A folder holding exactly one video is used as that video by extract and convert """
+    (tmp_path / "A.mp4").write_bytes(b"x")
+    video = str(tmp_path / "A.mp4")
+    args = commands.build_extract(commands.ExtractOptions(str(tmp_path), "/out", extract_every_n=5))
+    assert args[5] == video and args[-2:] == ["-N", "5"]
+    conv = commands.build_convert(commands.ConvertOptions(str(tmp_path), "/out", "/model"))
+    assert conv[5] == video and conv[conv.index("-w") + 1] == "ffmpeg"

@@ -15,9 +15,9 @@ import typing as T
 
 import gradio as gr
 
-from . import commands
+from . import commands, workspace
 from .history import RecentPaths
-from .paths import TRAINING_PREVIEW
+from .paths import TRAINING_PREVIEW, clean_path
 from .presets import (ALIGNERS, COLOR_ADJUSTMENTS, DEFAULT_PRESET, DETECTORS, MASK_TYPES,
                       MASKERS, PRESETS, TRAINERS, WRITERS, get_preset)
 from .runner import DONE, FAILED, STATUS_TEXT, STOPPED, JobRunner, Snapshot
@@ -29,8 +29,15 @@ CONSENT_TEXT = ("**使用须知：** 请仅在获得所有相关人员明确同�
 
 INTRO = """# Faceswap 简易版
 按顺序完成三步即可：**① 提取人脸** → **② 训练模型** → **③ 转换换脸**。
-路径请填写本机上的完整路径（可直接粘贴），下拉框会记住最近用过的路径。
+先在下面填一次「工作文件夹」，所有步骤的路径会自动填好并记住；也可以手动填写完整路径（可直接粘贴）。
 """
+
+WORKDIR_HELP = """按下「应用」后会在工作文件夹里建好这些子文件夹，**把素材放进去即可**：
+`A`（A 的素材：1 个视频或若干照片）· `B`（B 的素材）· `facesA` / `facesB`（提取出的人脸）·
+`model`（模型）· `output`（换脸结果）· `frames`（视频工具拆出的图片）"""
+
+VIDEO_TO_IMAGES = "视频 → 图片"
+IMAGES_TO_VIDEO = "图片 → 视频"
 
 CSS = """
 .fs-bar {background: var(--block-border-color); border-radius: 6px; height: 14px;
@@ -199,11 +206,75 @@ def run_video(consent: bool, action_label: str, input_path: str, output_path: st
 
 
 # Layout helpers
-def _path_box(label: str, field: str, info: str = "") -> gr.Dropdown:
-    """ A path input that is also a drop-down of recently used values """
+# Which layout entry fills each path box when a work folder is set
+BOX_DEFAULTS = {"extract.input": "src_a", "extract.output": "faces_a", "train.a": "faces_a",
+                "train.b": "faces_b", "train.model": "model", "convert.input": "src_a",
+                "convert.output": "output", "convert.model": "model", "video.input": "src_a",
+                "video.output": "frames"}
+VIDEO_DEFAULTS = {VIDEO_TO_IMAGES: ("src_a", "frames"), IMAGES_TO_VIDEO: ("output", "result")}
+PATH_BOXES: dict[str, gr.Dropdown] = {}
+
+
+def _path_update(field: str, value: str) -> T.Any:
+    """ Dropdown update that shows ``value`` and keeps the recent values as choices """
+    choices = [value] + [val for val in HISTORY.get(field) if val != value]
+    return gr.update(choices=choices, value=value)
+
+
+def _path_box(label: str, field: str, info: str = "", box: str = "") -> gr.Dropdown:
+    """ A path input that is also a drop-down of recently used values. When a work folder is
+    set, its layout path for ``box`` is the starting value. """
     recent = HISTORY.get(field)
-    return gr.Dropdown(choices=recent, value=recent[0] if recent else None, label=label,
-                       info=info or None, allow_custom_value=True, interactive=True)
+    value = workspace.layout(HISTORY.workdir).get(BOX_DEFAULTS.get(box, ""), "")
+    if value:
+        recent = [value] + [val for val in recent if val != value]
+    component = gr.Dropdown(choices=recent, value=recent[0] if recent else None, label=label,
+                            info=info or None, allow_custom_value=True, interactive=True)
+    if box:
+        PATH_BOXES[box] = component
+    return component
+
+
+def _fields_for(box: str) -> str:
+    """ The history field a path box remembers its values under """
+    return {"extract.input": "extract.input", "extract.output": "faces", "train.a": "faces",
+            "train.b": "faces_b", "train.model": "model", "convert.input": "extract.input",
+            "convert.output": "convert.output", "convert.model": "model",
+            "video.input": "video.input", "video.output": "video.output"}[box]
+
+
+def apply_workdir(workdir: str, video_action: str) -> list[T.Any]:
+    """ Create and remember the work folder, then fill every path box from its layout """
+    errors = workspace.create(workdir)
+    if errors:
+        return [f"❌ {errors[0]}"] + [gr.update() for _ in PATH_BOXES]
+    HISTORY.workdir = workdir
+    paths = workspace.layout(workdir)
+    values = {box: paths[key] for box, key in BOX_DEFAULTS.items()}
+    values["video.input"], values["video.output"] = (
+        paths[key] for key in VIDEO_DEFAULTS.get(video_action, VIDEO_DEFAULTS[VIDEO_TO_IMAGES]))
+    status = (f"✅ 已应用工作文件夹 `{clean_path(workdir)}`，所有步骤的路径都已填好，下次打开自动沿用。"
+              "把 A 的视频或照片放进 `A` 文件夹、B 的放进 `B` 文件夹即可开始。")
+    return [status] + [_path_update(_fields_for(box), values[box]) for box in PATH_BOXES]
+
+
+def fill_extract(workdir: str, person: str) -> list[T.Any]:
+    """ Fill the extract input/output with the A or B layout paths """
+    paths = workspace.layout(workdir or HISTORY.workdir)
+    if not paths:
+        return [gr.update(), gr.update()]
+    key = person.lower()
+    return [_path_update("extract.input", paths[f"src_{key}"]),
+            _path_update("faces", paths[f"faces_{key}"])]
+
+
+def fill_video(workdir: str, action_label: str) -> list[T.Any]:
+    """ Switch the video tool paths when the action changes (only with a work folder) """
+    paths = workspace.layout(workdir or HISTORY.workdir)
+    if not paths:
+        return [gr.update(), gr.update()]
+    src, dst = VIDEO_DEFAULTS.get(action_label, VIDEO_DEFAULTS[VIDEO_TO_IMAGES])
+    return [_path_update("video.input", paths[src]), _path_update("video.output", paths[dst])]
 
 
 def _output_area(with_preview: bool = False) -> list[T.Any]:
@@ -258,13 +329,24 @@ class _PresetFields:
         return [get_preset(preset, section)[key] for section, key, _ in self.items]
 
 
-def _extract_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> None:
+def _extract_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str,
+                 workdir: gr.Textbox) -> None:
     """ ① 提取人脸 """
     vals = get_preset(preset, "extract")
-    gr.Markdown("从照片文件夹或视频中找出人脸并裁剪保存。A、B 两个人需要**分别**提取一次。")
+    gr.Markdown("从照片文件夹或视频中找出人脸并裁剪保存。A、B 两个人需要**分别**提取一次："
+                "先点「填入 A」提取一次，完成后点「填入 B」再提取一次。")
+    with gr.Row():
+        fill_a = gr.Button("👤 填入 A 的路径", size="sm")
+        fill_b = gr.Button("👤 填入 B 的路径", size="sm")
     input_path = _path_box("输入：图片文件夹或视频文件", "extract.input",
-                           "例如 D:\\素材\\张三.mp4 或 /home/me/photos_a")
-    output_dir = _path_box("人脸输出文件夹", "faces", "提取出的人脸保存到这里，供训练使用")
+                           "例如 D:\\fs\\A（文件夹里只有一个视频时会自动使用它）",
+                           box="extract.input")
+    output_dir = _path_box("人脸输出文件夹", "faces", "提取出的人脸保存到这里，供训练使用",
+                           box="extract.output")
+    fill_a.click(lambda wd: fill_extract(wd, "A"), inputs=workdir,
+                 outputs=[input_path, output_dir])
+    fill_b.click(lambda wd: fill_extract(wd, "B"), inputs=workdir,
+                 outputs=[input_path, output_dir])
     with gr.Accordion("高级设置（一般无需修改）", open=False):
         with gr.Row():
             detector = fields.add("extract", "detector", gr.Dropdown(
@@ -299,9 +381,11 @@ def _train_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> None
     gr.Markdown("用 A、B 两个人的人脸训练换脸模型。训练时间越长效果越好，"
                 "随时可以点击「停止」，模型会先保存再退出，之后可以继续训练。")
     with gr.Row():
-        input_a = _path_box("人脸 A 文件夹（要被替换的人）", "faces")
-        input_b = _path_box("人脸 B 文件夹（换上去的人）", "faces_b")
-    model_dir = _path_box("模型文件夹", "model", "新建一个空文件夹，或选择已有模型以继续训练")
+        input_a = _path_box("人脸 A 文件夹（要被替换的人）", "faces", box="train.a")
+        input_b = _path_box("人脸 B 文件夹（换上去的人）", "faces_b", box="train.b")
+    model_dir = _path_box("模型文件夹", "model",
+                          "训练出的换脸模型保存在这里：第一次填一个空文件夹，继续训练填同一个",
+                          box="train.model")
     with gr.Accordion("高级设置（一般无需修改）", open=False):
         with gr.Row():
             trainer = fields.add("train", "trainer", gr.Dropdown(
@@ -335,9 +419,10 @@ def _convert_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> No
     vals = get_preset(preset, "convert")
     gr.Markdown("用训练好的模型把原始素材里的 A 换成 B。输入必须是**做过「提取」的同一份素材**"
                 "（提取时会在素材旁生成对齐文件 alignments）。")
-    input_path = _path_box("输入：原始图片文件夹或视频（A 的素材）", "extract.input")
-    output_dir = _path_box("输出文件夹", "convert.output")
-    model_dir = _path_box("模型文件夹", "model")
+    input_path = _path_box("输入：原始图片文件夹或视频（A 的素材）", "extract.input",
+                           box="convert.input")
+    output_dir = _path_box("输出文件夹", "convert.output", box="convert.output")
+    model_dir = _path_box("模型文件夹", "model", box="convert.model")
     with gr.Accordion("高级设置（一般无需修改）", open=False):
         alignments = gr.Textbox(label="对齐文件路径（留空 = 自动查找）")
         with gr.Row():
@@ -359,12 +444,14 @@ def _convert_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> No
                                      writer, color, mask_type, scale, swap], outputs)
 
 
-def _video_tab(consent: gr.Checkbox) -> None:
+def _video_tab(consent: gr.Checkbox, workdir: gr.Textbox) -> gr.Radio:
     """ 视频工具 (effmpeg shortcuts) """
     gr.Markdown("可选工具：把视频拆成图片，或把（转换后的）图片序列合成视频。")
-    action = gr.Radio(["视频 → 图片", "图片 → 视频"], value="视频 → 图片", label="操作")
-    input_path = _path_box("输入（视频文件，或图片文件夹）", "video.input")
-    output_path = _path_box("输出（图片文件夹，或视频文件如 out.mp4）", "video.output")
+    action = gr.Radio([VIDEO_TO_IMAGES, IMAGES_TO_VIDEO], value=VIDEO_TO_IMAGES, label="操作")
+    input_path = _path_box("输入（视频文件，或图片文件夹）", "video.input", box="video.input")
+    output_path = _path_box("输出（图片文件夹，或视频文件如 out.mp4）", "video.output",
+                            box="video.output")
+    action.change(fill_video, inputs=[workdir, action], outputs=[input_path, output_path])
     with gr.Accordion("合成视频选项", open=False):
         reference = gr.Textbox(label="参考视频（用于帧率和音频，可留空）")
         with gr.Row():
@@ -374,6 +461,7 @@ def _video_tab(consent: gr.Checkbox) -> None:
     outputs = _output_area()
     _wire(start, stop, run_video, [consent, action, input_path, output_path, reference,
                                    mux_audio, fps], outputs)
+    return action
 
 
 def _on_preset(name: str, fields: _PresetFields) -> list[T.Any]:
@@ -401,15 +489,25 @@ def build_app() -> gr.Blocks:
         mode = gr.Radio(list(PRESETS), value=preset, label="预设模式",
                         info=("新手模式：轻量模型、视频抽帧，快速出结果；"
                               "标准模式：Faceswap 默认参数"))
+        with gr.Group():
+            with gr.Row():
+                workdir = gr.Textbox(value=HISTORY.workdir, label="📁 工作文件夹（填一次即可）",
+                                     placeholder="例如 D:\\fs 或 C:\\Users\\你的用户名\\Desktop\\fmx",
+                                     scale=4)
+                apply = gr.Button("✔ 应用并自动填好所有路径", variant="secondary", scale=1)
+            workdir_status = gr.Markdown(WORKDIR_HELP)
+        PATH_BOXES.clear()
         with gr.Tabs():
             with gr.Tab("① 提取人脸"):
-                _extract_tab(consent, fields, preset)
+                _extract_tab(consent, fields, preset, workdir)
             with gr.Tab("② 训练模型"):
                 _train_tab(consent, fields, preset)
             with gr.Tab("③ 转换换脸"):
                 _convert_tab(consent, fields, preset)
             with gr.Tab("🎬 视频工具"):
-                _video_tab(consent)
+                video_action = _video_tab(consent, workdir)
+        apply.click(apply_workdir, inputs=[workdir, video_action],
+                    outputs=[workdir_status] + list(PATH_BOXES.values()))
         mode.change(lambda name: _on_preset(name, fields), inputs=mode,
                     outputs=fields.components)
         consent.change(_on_consent, inputs=consent, outputs=None)

@@ -57,6 +57,17 @@ def is_video(path: str) -> bool:
     return os.path.splitext(path)[-1].lower() in VIDEO_EXTENSIONS
 
 
+def media_path(path: str | None) -> str:
+    """ Clean a media input path. A folder that holds no images but exactly one video is taken
+    to mean that video, so users can simply point at e.g. ``D:\\fs\\A`` with ``A.mp4`` inside. """
+    path = clean_path(path)
+    if not path or not os.path.isdir(path) or count_images(path) > 0:
+        return path
+    videos = sorted(name for name in os.listdir(path)
+                    if is_video(name) and os.path.isfile(os.path.join(path, name)))
+    return os.path.join(path, videos[0]) if len(videos) == 1 else path
+
+
 def count_images(folder: str) -> int:
     """ Count the images directly inside a folder. Returns 0 if it is not a folder. """
     if not os.path.isdir(folder):
