@@ -700,6 +700,7 @@ class GetModel:
         if self._model_exists:
             self.logger.debug("[GetModel] Model exists: %s", repr(self.model_path))
             return
+        os.makedirs(self._cache_dir, exist_ok=True)
         self._download_model()
         self._unzip_model()
         os.remove(self._model_zip_path)
