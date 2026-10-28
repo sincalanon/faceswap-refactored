@@ -15,15 +15,13 @@ pip install -r requirements/_requirements_simple_gui.txt
 
 Gradio 是可选依赖，不安装也不影响原有的命令行和 Tk 图形界面。
 
-## Windows 免安装版（NVIDIA 显卡）
+## Windows 安装版（NVIDIA 显卡）
 
-不想装 Python 的 Windows 用户，可到仓库的 Releases 页面下载 `FaceswapSimple-win64-nvidia.7z.001`、`.002` 等全部分卷，放在同一文件夹，用 7-Zip 解压 `.7z.001`，然后双击 `FaceswapSimple.exe`，浏览器会自动打开本界面。
+Windows 用户无需安装 Python：到仓库 Releases 下载 `FaceswapSimple-Setup.exe` 和全部 `FaceswapSimple-Setup-*.bin`，放在同一文件夹，双击 Setup.exe 安装后从桌面启动即可；也提供 7z 便携版。Python、PyTorch（CUDA 13）和常用模型权重都已内置，无需联网下载。需要 RTX 20 系列或更新显卡、驱动 580+。
 
-- 需要 NVIDIA RTX 20 系列或更新显卡，驱动 580 或更新版本；Python、PyTorch（CUDA 13）和全部依赖已内置。
-- 黑色窗口是日志窗口，关闭它即退出程序。
-- 常用模型权重已内置；如需下载其他模型而 GitHub 超时，可设置环境变量 `FACESWAP_GITHUB_MIRROR`（如 `https://ghfast.top/`）作为下载加速前缀。
-- 可选参数：`FaceswapSimple.exe --port 8000`、`--no-browser`。
-- 维护者发布新版：推送 `v*` 标签（如 `git tag v1.0.1 && git push origin v1.0.1`），或在 Actions 里手动运行 `build/windows-nvidia`，打包结果会自动上传到对应 Release。
+完整图文步骤见 **[WINDOWS_TUTORIAL_zh-CN.md](WINDOWS_TUTORIAL_zh-CN.md)**。
+
+维护者发布新版：推送 `v*` 标签（如 `git tag v1.1.1 && git push origin v1.1.1`），或在 Actions 里手动运行 `build/windows-nvidia`，安装包和便携包会自动上传到对应 Release。
 
 ## 启动
 
@@ -55,7 +53,7 @@ python app.py
 2. 「人脸输出文件夹」填写一个新文件夹，例如 `D:\faces\A`；
 3. 点击「▶ 开始提取」。
 
-A、B 两个人需要**分别**提取一次（得到 `faces\A` 和 `faces\B`）。提取时会在素材旁边生成对齐文件（`alignments.fsa` 或 `视频名_alignments.fsa`），第三步转换时会用到。首次运行需要联网下载检测模型。
+A、B 两个人需要**分别**提取一次（得到 `faces\A` 和 `faces\B`）。提取时会在素材旁边生成对齐文件（`alignments.fsa` 或 `视频名_alignments.fsa`），第三步转换时会用到。源码方式首次运行需要联网下载检测模型（Windows 安装版已内置）；GitHub 访问慢时可设置环境变量 `FACESWAP_GITHUB_MIRROR`（如 `https://ghfast.top/`）作为下载加速前缀。
 
 ### ② 训练模型
 
