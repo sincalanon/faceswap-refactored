@@ -15,6 +15,15 @@ pip install -r requirements/_requirements_simple_gui.txt
 
 Gradio 是可选依赖，不安装也不影响原有的命令行和 Tk 图形界面。
 
+## Windows 免安装版（NVIDIA 显卡）
+
+不想装 Python 的 Windows 用户，可到仓库的 Releases 页面下载 `FaceswapSimple-win64-nvidia.7z.001`、`.002` 等全部分卷，放在同一文件夹，用 7-Zip 解压 `.7z.001`，然后双击 `FaceswapSimple.exe`，浏览器会自动打开本界面。
+
+- 需要 NVIDIA RTX 20 系列或更新显卡，驱动 580 或更新版本；Python、PyTorch（CUDA 13）和全部依赖已内置。
+- 黑色窗口是日志窗口，关闭它即退出程序。
+- 可选参数：`FaceswapSimple.exe --port 8000`、`--no-browser`。
+- 维护者发布新版：推送 `v*` 标签（如 `git tag v1.0.1 && git push origin v1.0.1`），或在 Actions 里手动运行 `build/windows-nvidia`，打包结果会自动上传到对应 Release。
+
 ## 启动
 
 ```bash

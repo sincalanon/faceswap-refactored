@@ -2,7 +2,7 @@
 
 本仓库基于 [deepfakes/faceswap](https://github.com/deepfakes/faceswap)（上游 `master` @ `f530cb7`），在**不改变正常功能**的前提下做了代码重构、静态检查清理和若干 bug 修复，并补充了单元测试。原项目的使用方法、安装方式和 GPL-3.0 许可证均保持不变，中文使用指南见 [USAGE_zh-CN.md](USAGE_zh-CN.md)，英文说明见 [README.md](README.md)、[INSTALL.md](INSTALL.md) 和 [USAGE.md](USAGE.md)。
 
-**新手推荐：** 新增中文简易网页界面（基于 Gradio，向导式三步：提取 → 训练 → 转换），`pip install gradio` 后运行 `python app.py` 即可，详见 [SIMPLE_GUI_zh-CN.md](SIMPLE_GUI_zh-CN.md)。
+**新手推荐：** 新增中文简易网页界面（基于 Gradio，向导式三步：提取 → 训练 → 转换），`pip install gradio` 后运行 `python app.py` 即可，详见 [SIMPLE_GUI_zh-CN.md](SIMPLE_GUI_zh-CN.md)。Windows + NVIDIA 显卡用户也可直接在 Releases 下载免安装版，双击 `FaceswapSimple.exe` 即用。
 
 > 请合法、合规地使用本项目：仅在获得当事人同意的素材上使用换脸技术，遵守原项目的伦理声明与所在地法律。
 
