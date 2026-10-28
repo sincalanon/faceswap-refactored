@@ -13,8 +13,8 @@ import sys
 import typing as T
 from dataclasses import dataclass
 
-from .paths import (FACESWAP_SCRIPT, TOOLS_SCRIPT, clean_path, count_images, has_model,
-                    is_video)
+from .paths import (FACESWAP_SCRIPT, IMAGE_EXTENSIONS, TOOLS_SCRIPT, clean_path, count_images,
+                    has_model, is_video)
 from .presets import AUTO
 
 MIN_TRAIN_IMAGES = 25
@@ -110,6 +110,15 @@ def _flag(flag: str, enabled: bool) -> list[str]:
     return [flag] if enabled else []
 
 
+def _every_n(opts: ExtractOptions) -> list[str]:
+    """ ``-N`` only makes sense for video frames. For a folder of photos every image is a
+    different shot, so skipping 4 of 5 would silently throw most of the material away. Batch
+    mode can contain videos, so it keeps the option. """
+    if not opts.batch_mode and not is_video(clean_path(opts.input_path)):
+        return []
+    return _number("-N", opts.extract_every_n, 1)
+
+
 def build_extract(opts: ExtractOptions) -> list[str]:
     """ Build the ``faceswap.py extract`` command line """
     return (_base(FACESWAP_SCRIPT, "extract")
@@ -118,7 +127,7 @@ def build_extract(opts: ExtractOptions) -> list[str]:
             + _choice("-A", opts.aligner)
             + _choice("-M", opts.masker, skip=(AUTO, "none"))
             + _number("-z", opts.size, 512)
-            + _number("-N", opts.extract_every_n, 1)
+            + _every_n(opts)
             + _number("-m", opts.min_size, 0)
             + _flag("-s", opts.skip_existing)
             + _flag("-b", opts.batch_mode))
@@ -211,10 +220,33 @@ def _check_faces_folder(path: str, label: str) -> list[str]:
     return []
 
 
+def _check_extract_input(path: str, batch_mode: bool) -> list[str]:
+    """ A folder input (not batch mode) must hold jpg/png images directly inside it """
+    path = clean_path(path)
+    if batch_mode or not os.path.isdir(path) or count_images(path) > 0:
+        return []
+    names = os.listdir(path)
+    videos = [name for name in names if is_video(name)]
+    if videos:
+        example = os.path.join(path, videos[0])
+        return [f"「输入」文件夹里没有图片，只有视频（如 {videos[0]}）。处理视频时请直接填写视频文件"
+                f"本身的路径，例如：{example}"]
+    if any(os.path.isdir(os.path.join(path, name)) for name in names):
+        return ["「输入」文件夹里没有直接放图片，图片可能在子文件夹里。请填写图片所在的那一层文件夹，"
+                "或在「高级设置」里勾选「批量模式」。"]
+    others = sorted({os.path.splitext(name)[-1].lower() for name in names
+                     if os.path.isfile(os.path.join(path, name))} - {"", ".fsa"})
+    found = f"（文件夹里是 {'、'.join(others[:5])} 格式）" if others else "（文件夹是空的）"
+    return [f"「输入」文件夹里没有可用的图片{found}。支持 {'、'.join(IMAGE_EXTENSIONS)}，"
+            "其他格式（如 webp、heic、jfif）请先转换成 jpg 或 png。"]
+
+
 def validate_extract(opts: ExtractOptions) -> list[str]:
     """ Pre-flight checks for extraction """
-    return (_require(opts.input_path, "输入（图片文件夹或视频）")
-            + _require_value(opts.output_dir, "人脸输出文件夹"))
+    errors = _require(opts.input_path, "输入（图片文件夹或视频）")
+    if not errors:
+        errors = _check_extract_input(opts.input_path, opts.batch_mode)
+    return errors + _require_value(opts.output_dir, "人脸输出文件夹")
 
 
 def validate_train(opts: TrainOptions) -> list[str]:

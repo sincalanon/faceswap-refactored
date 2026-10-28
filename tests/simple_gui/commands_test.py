@@ -109,8 +109,40 @@ def test_validate_extract(tmp_path):
     errors = commands.validate_extract(commands.ExtractOptions(str(tmp_path / "nope"), ""))
     assert len(errors) == 2
     assert "不存在" in errors[0] and "请填写" in errors[1]
+    (tmp_path / "a.jpg").write_bytes(b"x")
     ok_opts = commands.ExtractOptions(str(tmp_path), str(tmp_path / "faces"))
     assert not commands.validate_extract(ok_opts)
+
+
+def test_validate_extract_folder_without_images(tmp_path):
+    """ A folder with only a video, only sub folders or unsupported images explains what to do """
+    def check(folder):
+        return commands.validate_extract(commands.ExtractOptions(str(folder), "/out"))
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert "空的" in check(empty)[0]
+    vids = tmp_path / "vids"
+    vids.mkdir()
+    (vids / "clip.MP4").write_bytes(b"x")
+    assert "视频文件" in check(vids)[0] and "clip.MP4" in check(vids)[0]
+    nested = tmp_path / "nested"
+    (nested / "sub").mkdir(parents=True)
+    assert "子文件夹" in check(nested)[0]
+    webp = tmp_path / "webp"
+    webp.mkdir()
+    (webp / "a.webp").write_bytes(b"x")
+    assert ".webp" in check(webp)[0]
+    assert not commands.validate_extract(commands.ExtractOptions(str(nested), "/out",
+                                                                 batch_mode=True))
+
+
+def test_extract_every_n_only_for_video():
+    """ -N is dropped for a photo folder but kept for a video or batch mode """
+    folder = commands.build_extract(commands.ExtractOptions("/in", "/out", extract_every_n=5))
+    assert "-N" not in folder
+    video = commands.build_extract(commands.ExtractOptions("/in/a.mp4", "/out", extract_every_n=5))
+    assert video[-2:] == ["-N", "5"]
 
 
 def test_validate_train(tmp_path):

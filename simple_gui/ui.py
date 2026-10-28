@@ -278,7 +278,7 @@ def _extract_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> No
             size = fields.add("extract", "size", gr.Slider(
                 256, 1024, value=vals["size"], step=64, label="人脸图片尺寸（像素）"))
             every_n = fields.add("extract", "extract_every_n", gr.Slider(
-                1, 30, value=vals["extract_every_n"], step=1, label="视频每 N 帧提取一次"))
+                1, 30, value=vals["extract_every_n"], step=1, label="视频每 N 帧提取一次（只对视频生效，图片文件夹会处理全部图片）"))
             min_size = fields.add("extract", "min_size", gr.Slider(
                 0, 500, value=vals["min_size"], step=10, label="忽略小于此尺寸的人脸"))
         with gr.Row():
