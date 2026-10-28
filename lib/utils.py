@@ -614,6 +614,11 @@ class GetModel:
         self._cache_dir = os.path.join(PROJECT_ROOT, ".fs_cache")
         self._git_model_id = git_model_id
         self._url_base = "https://github.com/deepfakes-models/faceswap-models/releases/download"
+        # Optional prefix for networks where github.com is slow or blocked, e.g.
+        # FACESWAP_GITHUB_MIRROR=https://ghfast.top/  ->  https://ghfast.top/https://github.com/...
+        mirror = os.environ.get("FACESWAP_GITHUB_MIRROR", "").strip()
+        if mirror:
+            self._url_base = mirror.rstrip("/") + "/" + self._url_base
         self._chunk_size = 1024  # Chunk size for downloading and unzipping
         self._retries = 6
         self._get()
@@ -708,7 +713,7 @@ class GetModel:
                 req = request.Request(self._url_download)
                 if downloaded_size != 0:
                     req.add_header("Range", f"bytes={downloaded_size}-")
-                with request.urlopen(req, timeout=10) as response:
+                with request.urlopen(req, timeout=60) as response:
                     self.logger.debug("[GetModel] header info: {%s}", response.info())
                     self.logger.debug("[GetModel] Return Code: %s", response.getcode())
                     self._write_zipfile(response, downloaded_size)

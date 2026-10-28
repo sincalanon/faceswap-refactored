@@ -16,6 +16,9 @@ Faceswap 简易版 · Windows NVIDIA 便携包
 - 无需单独安装 Python、CUDA 或 cuDNN，已全部内置。
 
 注意
-- 第一次提取或训练时会联网下载模型权重，存放在 faceswap\.fs_cache。
+- 常用的提取/遮罩模型权重已内置在 faceswap\.fs_cache，无需联网下载。
+- 若用到未内置的模型且 GitHub 下载超时，可先设置镜像再启动，例如在命令行执行：
+  set FACESWAP_GITHUB_MIRROR=https://ghfast.top/
+  FaceswapSimple.exe
 - 启动参数：FaceswapSimple.exe --port 8000（改端口）、--no-browser（不自动打开浏览器）。
 - 仅可用于已获得当事人同意的素材，并遵守当地法律。本软件以 GPL-3.0 许可发布。

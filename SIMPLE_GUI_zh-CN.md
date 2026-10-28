@@ -21,6 +21,7 @@ Gradio 是可选依赖，不安装也不影响原有的命令行和 Tk 图形界
 
 - 需要 NVIDIA RTX 20 系列或更新显卡，驱动 580 或更新版本；Python、PyTorch（CUDA 13）和全部依赖已内置。
 - 黑色窗口是日志窗口，关闭它即退出程序。
+- 常用模型权重已内置；如需下载其他模型而 GitHub 超时，可设置环境变量 `FACESWAP_GITHUB_MIRROR`（如 `https://ghfast.top/`）作为下载加速前缀。
 - 可选参数：`FaceswapSimple.exe --port 8000`、`--no-browser`。
 - 维护者发布新版：推送 `v*` 标签（如 `git tag v1.0.1 && git push origin v1.0.1`），或在 Actions 里手动运行 `build/windows-nvidia`，打包结果会自动上传到对应 Release。
 

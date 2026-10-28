@@ -62,6 +62,27 @@ jobs:
           '{"backend": "nvidia"}' | Out-File -Encoding ascii "$env:DIST\faceswap\config\.faceswap"
           Copy-Item .install\windows_portable\README.txt "$env:DIST\使用说明.txt"
 
+      - name: Pre-download model weights (users behind slow/blocked GitHub need no download)
+        env:
+          FACESWAP_BACKEND: cpu
+          KERAS_BACKEND: torch
+        run: |
+          Push-Location "$env:DIST\faceswap"
+          @'
+          from lib.utils import GetModel
+          models = [("retinaface_v1.pth", 32), ("retinaface_v2.pth", 32), ("hrnet_landmark_v2.pth", 34),
+                    ("s3fd_torch_v3.pth", 11), ("face-alignment-network_2d4_v4.pth", 13),
+                    ("bisenet_face_parsing_v4.pth", 14), ("bisenet_face_parsing_v5.pth", 14),
+                    ("bisenet_face_parsing_v6.pth", 14), ("tface_v1.pth", 33), ("tface_v2.pth", 33),
+                    ("vggface2_resnet50_v3.pth", 10), ("DFL_256_sigmoid_v2.pth", 6)]
+          for name, git_id in models:
+              GetModel(name, git_id)
+              print("OK", name)
+          '@ | & "$env:DIST\python\python.exe" -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem .fs_cache | Format-Table Name, @{n="MB";e={[int]($_.Length/1MB)}}
+          Pop-Location
+
       - name: Build launcher exe
         run: |
           $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
@@ -106,7 +127,7 @@ jobs:
       - name: Clean up
         run: |
           Get-ChildItem $env:DIST -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
-          Remove-Item -Recurse -Force "$env:DIST\faceswap\.fs_cache", "$env:DIST\faceswap\training_preview.png" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:DIST\faceswap\training_preview.png" -ErrorAction SilentlyContinue
           $size = (Get-ChildItem $env:DIST -Recurse -File | Measure-Object Length -Sum).Sum / 1GB
           Write-Host ("Package size: {0:N2} GB" -f $size)
 
