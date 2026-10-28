@@ -135,3 +135,31 @@ def test_runner_shutdown():
     job.start(_python("import time; time.sleep(60)"), "convert")
     job.shutdown(timeout=5)
     assert not job.running
+
+
+def test_dashboard_walks_through_the_steps(tmp_path):
+    """ The dashboard reports each stage and suggests the next step """
+    from simple_gui import ui, workspace
+    work = str(tmp_path / "fs")
+    workspace.create(work)
+    paths = workspace.layout(work)
+    assert "放进" in ui.render_dashboard(work)
+    open(os.path.join(paths["src_a"], "a.mp4"), "wb").close()
+    open(os.path.join(paths["src_b"], "b.jpg"), "wb").close()
+    dash = ui.render_dashboard(work)
+    assert "1 个视频" in dash and "1 张照片" in dash and "填入 A" in dash
+    for key in ("faces_a", "faces_b"):
+        for idx in range(30):
+            open(os.path.join(paths[key], f"{idx}.png"), "wb").close()
+    assert "开始训练" in ui.render_dashboard(work)
+    open(os.path.join(paths["model"], "m_state.json"), "w").close()
+    assert "开始转换" in ui.render_dashboard(work)
+    open(os.path.join(paths["output"], "a.mp4"), "wb").close()
+    assert "🎉" in ui.render_dashboard(work)
+
+
+def test_open_folder_missing(tmp_path):
+    """ Opening a folder that does not exist explains instead of failing """
+    from simple_gui import ui
+    assert "不存在" in ui.open_folder(str(tmp_path / "nope" / "x"))
+    assert "不存在" in ui.open_folder("")

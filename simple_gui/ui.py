@@ -11,13 +11,16 @@ import atexit
 import html
 import inspect
 import os
+import subprocess
+import sys
 import typing as T
 
 import gradio as gr
 
 from . import commands, workspace
 from .history import RecentPaths
-from .paths import TRAINING_PREVIEW, clean_path
+from .paths import (IMAGE_EXTENSIONS, TRAINING_PREVIEW, clean_path, count_images, has_model,
+                    is_video)
 from .presets import (ALIGNERS, COLOR_ADJUSTMENTS, DEFAULT_PRESET, DETECTORS, MASK_TYPES,
                       MASKERS, PRESETS, TRAINERS, WRITERS, get_preset)
 from .runner import DONE, FAILED, STATUS_TEXT, STOPPED, JobRunner, Snapshot
@@ -27,9 +30,8 @@ POLL_SECONDS = 1.0
 CONSENT_TEXT = ("**使用须知：** 请仅在获得所有相关人员明确同意的情况下使用其照片或视频，"
                 "并遵守当地法律法规。禁止将本工具用于欺诈、骚扰、色情或侵犯他人权益的用途。")
 
-INTRO = """# Faceswap 简易版
-按顺序完成三步即可：**① 提取人脸** → **② 训练模型** → **③ 转换换脸**。
-先在下面填一次「工作文件夹」，所有步骤的路径会自动填好并记住；也可以手动填写完整路径（可直接粘贴）。
+INTRO = """# 🎭 Faceswap 简易版
+按顺序完成三步：**① 提取人脸** → **② 训练模型** → **③ 转换换脸**。先填一次「工作文件夹」，所有路径自动填好。
 """
 
 WORKDIR_HELP = """按下「应用」后会在工作文件夹里建好这些子文件夹，**把素材放进去即可**：
@@ -44,6 +46,11 @@ CSS = """
          overflow: hidden;}
 .fs-bar > div {background: var(--color-accent); height: 100%; transition: width .5s;}
 .fs-progress-text {font-size: .9em; margin-top: 4px; opacity: .85;}
+.gradio-container {max-width: 1280px !important; margin: 0 auto !important;}
+.fs-consent {font-size: .85em; opacity: .8;}
+.fs-dash table {width: 100%; text-align: center;}
+.fs-dash td, .fs-dash th {padding: 4px 6px !important;}
+button[role="tab"] {font-size: 1.05em !important; font-weight: 600 !important;}
 """
 
 DARK_TOGGLE_JS = "() => { document.body.classList.toggle('dark'); }"
@@ -205,6 +212,81 @@ def run_video(consent: bool, action_label: str, input_path: str, output_path: st
     yield from _stream(opts, consent, {"video.input": input_path, "video.output": output_path})
 
 
+# Progress dashboard
+def _describe_source(folder: str) -> str:
+    """ What a material folder (A or B) holds, for the dashboard """
+    if not os.path.isdir(folder):
+        return "⬜ 未放"
+    names = os.listdir(folder)
+    videos = [name for name in names if is_video(name)]
+    images = count_images(folder)
+    if images:
+        return f"✅ {images} 张照片"
+    if len(videos) == 1:
+        return "✅ 1 个视频"
+    if videos:
+        return f"⚠️ {len(videos)} 个视频"
+    return "⬜ 未放"
+
+
+def _count_results(folder: str) -> int:
+    """ Number of converted images or videos in the output folder """
+    if not os.path.isdir(folder):
+        return 0
+    return sum(1 for name in os.listdir(folder)
+               if is_video(name) or os.path.splitext(name)[-1].lower() in IMAGE_EXTENSIONS)
+
+
+def render_dashboard(workdir: str | None) -> str:
+    """ A one row table of where the user is in the workflow, plus the next thing to do """
+    paths = workspace.layout(workdir or HISTORY.workdir)
+    if not paths or not os.path.isdir(clean_path(workdir or HISTORY.workdir)):
+        return WORKDIR_HELP
+    faces_a, faces_b = count_images(paths["faces_a"]), count_images(paths["faces_b"])
+    src_a, src_b = _describe_source(paths["src_a"]), _describe_source(paths["src_b"])
+    model = has_model(paths["model"])
+    results = _count_results(paths["output"])
+    if not src_a.startswith("✅") or not src_b.startswith("✅"):
+        tip = "把 A 的视频/照片放进 `A` 文件夹，B 的放进 `B` 文件夹，然后点「🔄 刷新」。"
+    elif faces_a == 0:
+        tip = "去「① 提取人脸」点「填入 A 的路径」→「开始提取」。"
+    elif faces_b == 0:
+        tip = "去「① 提取人脸」点「填入 B 的路径」→「开始提取」。"
+    elif min(faces_a, faces_b) < commands.MIN_TRAIN_IMAGES:
+        tip = f"人脸太少（每边至少 {commands.MIN_TRAIN_IMAGES} 张），请换更长更清楚的素材再提取。"
+    elif not model:
+        tip = "先删掉 facesA / facesB 里的错脸和模糊脸，再去「② 训练模型」点「开始训练」。"
+    elif not results:
+        tip = "预览满意后停止训练，去「③ 转换换脸」点「开始转换」。"
+    else:
+        tip = "🎉 已生成成品，点「③ 转换换脸」里的「📂 打开输出文件夹」查看。"
+
+    def faces(num: int) -> str:
+        return f"✅ {num} 张" if num else "⬜ 0 张"
+
+    return ("| A 素材 | B 素材 | A 人脸 | B 人脸 | 模型 | 成品 |\n|---|---|---|---|---|---|\n"
+            f"| {src_a} | {src_b} | {faces(faces_a)} | {faces(faces_b)} | "
+            f"{'✅ 已训练' if model else '⬜ 未训练'} | {'✅ ' if results else '⬜ '}{results} 个 |"
+            f"\n\n**下一步：** {tip}")
+
+
+def open_folder(path: str | None) -> str:
+    """ Open a folder (or the folder of a file) in the system file manager """
+    path = clean_path(path)
+    if path and not os.path.isdir(path):
+        path = os.path.dirname(path)
+    if not path or not os.path.isdir(path):
+        return "❌ **文件夹还不存在**：请先填写路径，或先运行这一步。"
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type:ignore[attr-defined]  # pylint:disable=no-member
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+    except OSError as err:
+        return f"❌ 无法打开文件夹：{err}"
+    return f"📂 已打开：`{path}`"
+
+
 # Layout helpers
 # Which layout entry fills each path box when a work folder is set
 BOX_DEFAULTS = {"extract.input": "src_a", "extract.output": "faces_a", "train.a": "faces_a",
@@ -253,8 +335,7 @@ def apply_workdir(workdir: str, video_action: str) -> list[T.Any]:
     values = {box: paths[key] for box, key in BOX_DEFAULTS.items()}
     values["video.input"], values["video.output"] = (
         paths[key] for key in VIDEO_DEFAULTS.get(video_action, VIDEO_DEFAULTS[VIDEO_TO_IMAGES]))
-    status = (f"✅ 已应用工作文件夹 `{clean_path(workdir)}`，所有步骤的路径都已填好，下次打开自动沿用。"
-              "把 A 的视频或照片放进 `A` 文件夹、B 的放进 `B` 文件夹即可开始。")
+    status = f"✅ 已应用 `{clean_path(workdir)}`，所有路径已填好，下次打开自动沿用。"
     return [status] + [_path_update(_fields_for(box), values[box]) for box in PATH_BOXES]
 
 
@@ -284,29 +365,36 @@ def _output_area(with_preview: bool = False) -> list[T.Any]:
     outputs: list[T.Any] = [status, progress]
     if with_preview:
         with gr.Row():
-            log = gr.Textbox(label="运行日志", lines=16, max_lines=16, autoscroll=True,
-                             interactive=False, scale=1)
+            log = gr.Textbox(label="运行日志（出错时请截图这里）", lines=16, max_lines=16,
+                             autoscroll=True, interactive=False, scale=1)
             preview = gr.Image(label="训练预览（每次保存模型时更新）", interactive=False,
                                type="pil", scale=1)
         return outputs + [log, preview]
-    log = gr.Textbox(label="运行日志", lines=16, max_lines=16, autoscroll=True,
-                     interactive=False)
+    log = gr.Textbox(label="运行日志（出错时请截图这里）", lines=12, max_lines=12,
+                     autoscroll=True, interactive=False)
     return outputs + [log]
 
 
-def _buttons(start_label: str) -> tuple[gr.Button, gr.Button]:
-    """ Start + stop buttons """
+def _buttons(start_label: str) -> tuple[gr.Button, gr.Button, gr.Button]:
+    """ Start, stop and "open output folder" buttons """
     with gr.Row():
-        start = gr.Button(start_label, variant="primary")
-        stop = gr.Button("⏹ 停止", variant="stop")
-    return start, stop
+        start = gr.Button(start_label, variant="primary", scale=3)
+        stop = gr.Button("⏹ 停止", variant="stop", scale=1)
+        opener = gr.Button("📂 打开输出文件夹", scale=1)
+    return start, stop, opener
+
+
+JOB_EVENTS: list[T.Any] = []
+""" The start events of every tab, so the dashboard can refresh when a job ends """
 
 
 def _wire(start: gr.Button, stop: gr.Button, func: T.Callable, inputs: list[T.Any],
-          outputs: list[T.Any]) -> None:
-    """ Connect a tab's buttons. The stop button writes into the status line. """
-    start.click(func, inputs=inputs, outputs=outputs)
+          outputs: list[T.Any], opener: tuple[gr.Button, gr.Dropdown]) -> None:
+    """ Connect a tab's buttons. The stop button writes into the status line and the open
+    button opens the folder currently in the given path box. """
+    JOB_EVENTS.append(start.click(func, inputs=inputs, outputs=outputs))
     stop.click(stop_job, inputs=None, outputs=outputs[0])
+    opener[0].click(open_folder, inputs=opener[1], outputs=outputs[0])
 
 
 class _PresetFields:
@@ -368,11 +456,11 @@ def _extract_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str,
                 value=vals["skip_existing"], label="跳过已处理过的帧"))
             batch_mode = gr.Checkbox(value=False,
                                      label="批量模式（输入为包含多个视频/文件夹的父目录）")
-    start, stop = _buttons("▶ 开始提取")
+    start, stop, open_btn = _buttons("▶ 开始提取")
     outputs = _output_area()
     _wire(start, stop, run_extract, [consent, input_path, output_dir, detector, aligner, masker,
                                      size, every_n, min_size, skip_existing, batch_mode],
-          outputs)
+          outputs, opener=(open_btn, output_dir))
 
 
 def _train_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> None:
@@ -407,11 +495,11 @@ def _train_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> None
                 value=vals["no_flip"], label="关闭随机翻转"))
             no_color = fields.add("train", "no_augment_color", gr.Checkbox(
                 value=vals["no_augment_color"], label="关闭颜色增强"))
-    start, stop = _buttons("▶ 开始训练")
+    start, stop, open_btn = _buttons("▶ 开始训练")
     outputs = _output_area(with_preview=True)
     _wire(start, stop, run_train, [consent, input_a, input_b, model_dir, trainer, batch_size,
                                    iterations, save_interval, write_preview, warp, no_flip,
-                                   no_color], outputs)
+                                   no_color], outputs, opener=(open_btn, model_dir))
 
 
 def _convert_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> None:
@@ -438,10 +526,11 @@ def _convert_tab(consent: gr.Checkbox, fields: _PresetFields, preset: str) -> No
                 25, 400, value=vals["output_scale"], step=25, label="输出缩放（%）"))
             swap = fields.add("convert", "swap_model", gr.Checkbox(
                 value=vals["swap_model"], label="反向转换（B → A）"))
-    start, stop = _buttons("▶ 开始转换")
+    start, stop, open_btn = _buttons("▶ 开始转换")
     outputs = _output_area()
     _wire(start, stop, run_convert, [consent, input_path, output_dir, model_dir, alignments,
-                                     writer, color, mask_type, scale, swap], outputs)
+                                     writer, color, mask_type, scale, swap], outputs,
+          opener=(open_btn, output_dir))
 
 
 def _video_tab(consent: gr.Checkbox, workdir: gr.Textbox) -> gr.Radio:
@@ -457,10 +546,10 @@ def _video_tab(consent: gr.Checkbox, workdir: gr.Textbox) -> gr.Radio:
         with gr.Row():
             mux_audio = gr.Checkbox(value=False, label="加入参考视频的音频")
             fps = gr.Number(value=25, label="帧率（没有参考视频时使用）")
-    start, stop = _buttons("▶ 开始")
+    start, stop, open_btn = _buttons("▶ 开始")
     outputs = _output_area()
     _wire(start, stop, run_video, [consent, action, input_path, output_path, reference,
-                                   mux_audio, fps], outputs)
+                                   mux_audio, fps], outputs, opener=(open_btn, output_path))
     return action
 
 
@@ -482,21 +571,26 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="Faceswap 简易版", **_blocks_style_kwargs()) as app:
         with gr.Row():
             gr.Markdown(INTRO)
-            dark = gr.Button("🌓 深色/浅色", size="sm", scale=0)
-        gr.Markdown(CONSENT_TEXT)
-        consent = gr.Checkbox(value=HISTORY.last("consent") == "yes",
-                              label="我已阅读并同意使用须知")
-        mode = gr.Radio(list(PRESETS), value=preset, label="预设模式",
-                        info=("新手模式：轻量模型、视频抽帧，快速出结果；"
-                              "标准模式：Faceswap 默认参数"))
+            dark = gr.Button("🌓 深色/浅色", size="sm", scale=0, min_width=120)
+        with gr.Row(equal_height=True):
+            with gr.Column(scale=3):
+                gr.Markdown(CONSENT_TEXT, elem_classes="fs-consent")
+                consent = gr.Checkbox(value=HISTORY.last("consent") == "yes",
+                                      label="我已阅读并同意使用须知")
+            mode = gr.Radio(list(PRESETS), value=preset, label="预设模式", scale=2,
+                            info="新手模式：轻量模型、快速出结果；标准模式：Faceswap 默认参数")
         with gr.Group():
-            with gr.Row():
+            with gr.Row(equal_height=True):
                 workdir = gr.Textbox(value=HISTORY.workdir, label="📁 工作文件夹（填一次即可）",
                                      placeholder="例如 D:\\fs 或 C:\\Users\\你的用户名\\Desktop\\fmx",
                                      scale=4)
-                apply = gr.Button("✔ 应用并自动填好所有路径", variant="secondary", scale=1)
-            workdir_status = gr.Markdown(WORKDIR_HELP)
+                apply = gr.Button("✔ 应用（自动填好路径）", variant="primary", scale=0, min_width=220)
+                refresh = gr.Button("🔄 刷新进度", scale=0, min_width=140)
+                open_work = gr.Button("📂 打开文件夹", scale=0, min_width=140)
+            workdir_status = gr.Markdown("")
+            dashboard = gr.Markdown(render_dashboard(HISTORY.workdir), elem_classes="fs-dash")
         PATH_BOXES.clear()
+        JOB_EVENTS.clear()
         with gr.Tabs():
             with gr.Tab("① 提取人脸"):
                 _extract_tab(consent, fields, preset, workdir)
@@ -507,7 +601,13 @@ def build_app() -> gr.Blocks:
             with gr.Tab("🎬 视频工具"):
                 video_action = _video_tab(consent, workdir)
         apply.click(apply_workdir, inputs=[workdir, video_action],
-                    outputs=[workdir_status] + list(PATH_BOXES.values()))
+                    outputs=[workdir_status] + list(PATH_BOXES.values())).then(
+                        render_dashboard, inputs=workdir, outputs=dashboard)
+        refresh.click(render_dashboard, inputs=workdir, outputs=dashboard)
+        open_work.click(open_folder, inputs=workdir, outputs=workdir_status)
+        for event in JOB_EVENTS:
+            event.then(render_dashboard, inputs=workdir, outputs=dashboard)
+        app.load(render_dashboard, inputs=workdir, outputs=dashboard)
         mode.change(lambda name: _on_preset(name, fields), inputs=mode,
                     outputs=fields.components)
         consent.change(_on_consent, inputs=consent, outputs=None)
