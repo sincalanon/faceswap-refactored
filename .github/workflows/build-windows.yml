@@ -144,14 +144,14 @@ jobs:
       - name: Installer (Inno Setup, split into 1.9 GB slices)
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            choco install innosetup -y --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          # Latest Inno Setup ships Simplified Chinese as an official language
+          choco upgrade innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $iscc /? | Select-Object -First 2
           $langDir = Join-Path (Split-Path $iscc) "Languages"
           if (-not (Test-Path "$langDir\ChineseSimplified.isl")) {
             Invoke-WebRequest -UseBasicParsing -OutFile "$langDir\ChineseSimplified.isl" `
-              https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseSimplified.isl
+              https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl
           }
           $ver = $env:RELEASE_TAG.TrimStart("v")
           & $iscc /Q "/DAppVersion=$ver" "/DSourceDir=$env:DIST" "/DOutputDir=D:\out" .install\windows_portable\FaceswapSimple.iss
