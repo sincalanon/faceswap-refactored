@@ -26,6 +26,7 @@
 2. **TensorBoard 日志读取**（`lib/gui/analysis/event_reader.py`）：缓存在创建之前就可能被调用 `reset()`，现调整为先创建缓存。
 3. **序列化器查找**（`lib/serializer.py`）：未知名称原来返回 `None`，现返回 JSON 序列化器；缺少 PyYAML 时原来返回“类”而不是“实例”，现已修正。
 4. **`tools.py`**：`bad_args()` 依赖一个只在直接运行脚本时才存在的全局变量，现将命令行构建移入 `_main()`，帮助输出不变。
+5. **RetinaFace 检测器颜色通道反了**（`plugins/extract/detect/retinaface.py`，上游 issue #1568）：权重按 BGR 输入和 BGR 均值 (104, 117, 123) 训练，代码却设成 `is_rgb=True` 送入 RGB，导致大量漏检和误检。现改为 `is_rgb=False`。实测合影中 MobileNet 从 1 张脸提升到 20 张，ResNet 也多检出 3–5 张，单人照结果不变。
 
 ## 代码重构
 

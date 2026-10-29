@@ -52,7 +52,9 @@ class RetinaFace(ExtractPlugin):
     def __init__(self) -> None:
         super().__init__(input_size=640,
                          batch_size=cfg.batch_size(),
-                         is_rgb=True,
+                         # Weights were trained on BGR input with BGR means (104, 117, 123).
+                         # Feeding RGB causes missed faces/false positives (upstream #1568)
+                         is_rgb=False,
                          dtype="float32",
                          scale=(0, 255),
                          force_cpu=cfg.cpu())
