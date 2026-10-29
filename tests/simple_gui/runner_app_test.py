@@ -139,7 +139,8 @@ def test_runner_shutdown():
 
 def test_dashboard_walks_through_the_steps(tmp_path):
     """ The dashboard reports each stage and suggests the next step """
-    from simple_gui import ui, workspace
+    pytest.importorskip("gradio")
+    from simple_gui import ui, workspace  # pylint:disable=import-outside-toplevel
     work = str(tmp_path / "fs")
     workspace.create(work)
     paths = workspace.layout(work)
@@ -160,6 +161,7 @@ def test_dashboard_walks_through_the_steps(tmp_path):
 
 def test_open_folder_missing(tmp_path):
     """ Opening a folder that does not exist explains instead of failing """
-    from simple_gui import ui
+    pytest.importorskip("gradio")
+    from simple_gui import ui  # pylint:disable=import-outside-toplevel
     assert "不存在" in ui.open_folder(str(tmp_path / "nope" / "x"))
     assert "不存在" in ui.open_folder("")
